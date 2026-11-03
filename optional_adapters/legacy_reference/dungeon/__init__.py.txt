@@ -1,0 +1,24 @@
+"""
+副本统计子系统（SQLite 索引 + 聚合 + 文本报表）
+
+口径对齐「龙猫站团本小精灵 v6.5」：
+  樱桃 AutoLog *.ini（主源）+ 土拨鼠 newRecord.db（第二源，经 lib\\11.DAT 映射副本名）
+"""
+from . import config, recordini, report  # noqa: F401
+from .report import (  # noqa: F401
+    Store,
+    fmt_dur,
+    norm_dungeon,
+    parse_file,
+    parse_tobo_db,
+    range_of,
+    render_text_matrix,
+    render_text_summary,
+)
+
+__all__ = [
+    "config", "recordini", "report",
+    "Store", "fmt_dur", "norm_dungeon", "parse_file", "parse_tobo_db",
+    "range_of", "render_text_matrix", "render_text_summary",
+]
+__version__ = "2.0.0"

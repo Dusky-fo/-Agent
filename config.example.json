@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "monitor": {
+    "enabled": true,
+    "process_names": [],
+    "interval": 5
+  },
+  "qq": {
+    "enabled": false,
+    "appid": "",
+    "secret": "",
+    "allowed_users": [],
+    "is_sandbox": false
+  },
+  "files": {
+    "allow_desktop": false,
+    "roots": [],
+    "max_mb": 30,
+    "max_depth": 4
+  },
+  "local_data": {
+    "roots": []
+  },
+  "watch": {
+    "enabled": false,
+    "interval": 3,
+    "roots": [],
+    "include": [
+      "*"
+    ],
+    "exclude": [
+      ".*",
+      "*.tmp"
+    ],
+    "logs": [],
+    "keywords": [
+      "ERROR",
+      "异常",
+      "Traceback"
+    ],
+    "patterns": [],
+    "merge_seconds": 5,
+    "max_files": 5000
+  },
+  "anomalies": {
+    "enabled": false,
+    "cpu_percent": 90,
+    "memory_mb": 2048,
+    "sustain_seconds": 30,
+    "absence_seconds": 60,
+    "hang_seconds": 30
+  },
+  "inbound": {
+    "enabled": false,
+    "directory": "",
+    "max_mb": 30
+  },
+  "file_manager": {
+    "roots": []
+  },
+  "notifications": {
+    "cooldown": 30,
+    "max_attempts": 3
+  },
+  "panel": {
+    "port": 18765
+  },
+  "plugins": {
+    "enabled": [],
+    "trusted_hashes": {}
+  }
+}

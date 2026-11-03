@@ -1,0 +1,312 @@
+# -*- coding: utf-8 -*-
+"""
+dungeon.cli —— 命令行报表（严格口径，对齐 龙猫站团本小精灵 v6.5）
+
+用法：
+  python -m dungeon sync [--full] [--source all|cherry|tobo]
+  python -m dungeon week [--offset -1] [--by-diff] [--source all|cherry|tobo]
+  python -m dungeon summary [--range today|week|lastweek]
+  python -m dungeon items  [--range week] [--bucket item1|all]
+  python -m dungeon eff    [--range week]
+  python -m dungeon daily  [--offset 0]
+  python -m dungeon export --range week --out report.csv
+
+所有命令都支持 --out（UTF-8 落盘），避免 Windows 控制台编码问题。
+"""
+import argparse
+import csv
+import os
+import sys
+from datetime import datetime
+
+from . import config, recordini, report
+
+DEFAULT_DB = os.path.join(config.base_dir(), "report.db")
+
+
+def db_of(args):
+    return getattr(args, "db", "") or DEFAULT_DB
+
+
+def rng(name, offset=None):
+    if offset is not None:
+        now = datetime.now()
+        s = (now - __import__("datetime").timedelta(days=now.weekday())) \
+            .replace(hour=0, minute=0, second=0, microsecond=0)
+        s = s + __import__("datetime").timedelta(days=7 * offset)
+        return int(s.timestamp()), int((s + __import__("datetime").timedelta(days=7)).timestamp())
+    s, e, _label = report.range_of(name)
+    return s, e
+
+
+def cell_w(s):
+    return sum(2 if ord(c) > 127 else 1 for c in str(s))
+
+
+def pad(s, width, align="<"):
+    s = str(s)
+    p = max(0, width - cell_w(s))
+    return (s + " " * p) if align == "<" else (" " * p + s)
+
+
+def fmt_sec(sec):
+    if not sec:
+        return "—"
+    sec = int(sec)
+    return "%d:%02d" % (sec // 60, sec % 60)
+
+
+# --------------------------------------------------------------------------
+
+def cmd_sync(args):
+    st = report.Store(db_of(args))
+    lines = ["同步开始（库：%s）" % db_of(args)]
+    before = st.count()
+    if args.source in ("all", "cherry"):
+        n = st.sync(config.autolog_dir(), report.role_name_from_hex,
+                    full=args.full, days=args.days)
+        lines.append("  樱桃：新增 %d 场" % n)
+    if args.source in ("all", "tobo"):
+        n2 = st.sync_tobo(config.tobo_root(), full=args.full,
+                          with_drops=args.with_drops)
+        lines.append("  土拨鼠：新增 %d 场" % n2)
+    after = st.count()
+    lines.append("  库内总场次：%d → %d" % (before, after))
+    lines.append("  副本名词库：%d 条（lib\\11.DAT）" % len(recordini.load_dungeon_dict()))
+    st.close()
+    return lines
+
+
+def cmd_week(args):
+    st = report.Store(db_of(args))
+    s, e = rng("week", args.offset)
+    mx = st.matrix_strict(s, e, with_diff=args.by_diff,
+                          limits=recordini.load_limits(),
+                          orders=recordini.load_role_orders(),
+                          blocked=recordini.load_blocked())
+    su = st.summary(s, e)
+    st.close()
+
+    label = "本周" if args.offset in (None, 0) else ("上周" if args.offset == -1 else "第%d周" % args.offset)
+    lines = ["%s  %s ~ %s" % (label,
+                              datetime.fromtimestamp(s).strftime("%Y-%m-%d"),
+                              datetime.fromtimestamp(e).strftime("%Y-%m-%d")),
+             "场次 %d｜死亡 %d｜角色 %d｜副本 %d｜平均耗时 %s" % (
+                 su["runs"], su["deaths"], mx["totals"]["chars"],
+                 mx["totals"]["dungeons"], fmt_sec(su["avg_sec"])), ""]
+
+    cols = mx["cols"]
+    if not cols:
+        lines.append("（该区间没有记录）")
+        return lines
+
+    # 文本报表放不下几十列：按场次取前 N，其余在 CSV 里看
+    total_by_col = {}
+    for k, v in mx["cells"].items():
+        ck = k.split("|", 1)[1]
+        total_by_col[ck] = total_by_col.get(ck, 0) + v["runs"]
+    cols_all = sorted(cols, key=lambda c: -total_by_col.get(c["key"], 0))
+    show = cols_all[:max(1, getattr(args, "cols", 12))]
+    show.sort(key=lambda c: (c["limit"], c["name"]))
+
+    W = 7
+    head = pad("角色", 9) + "".join(pad(c["name"][:4], W, ">") for c in show)
+    lines.append(head)
+    lines.append(" " * 9 + "".join(pad("/%d" % c["limit"], W, ">") for c in show))
+    lines.append("-" * max(cell_w(head), 40))
+    for r in mx["rows"]:
+        row = pad(str(r["role"]).strip()[:6], 9)
+        for c in show:
+            cell = mx["cells"].get("%s|%s" % (r["role"], c["key"]))
+            if not cell:
+                row += pad("·", W, ">")
+            else:
+                mark = "+" if cell["over"] else ("*" if cell["done"] else "")
+                row += pad("%d/%d%s" % (cell["runs"], c["limit"], mark), W, ">")
+        lines.append(row)
+    lines.append("")
+    if len(cols_all) > len(show):
+        lines.append("（只显示场次最多的 %d 个副本，共 %d 个；完整矩阵用 export）"
+                     % (len(show), len(cols_all)))
+    lines.append("说明：* 已达标，+ 超出上限，· 未打；分母来自 记录.ini 的 [N次副本]")
+    return lines
+
+
+def cmd_summary(args):
+    st = report.Store(db_of(args))
+    s, e, label = report.range_of(args.range)
+    su = st.summary(s, e)
+    dt = st.death_report(s, e)
+    tops = st.top_dungeons(s, e, 8)
+    st.close()
+    lines = ["%s  %s ~ %s" % (label,
+                              datetime.fromtimestamp(s).strftime("%m-%d %H:%M"),
+                              datetime.fromtimestamp(e).strftime("%m-%d %H:%M")),
+             "场次 %d｜死亡 %d｜角色 %d｜副本 %d｜平均耗时 %s" % (
+                 su["runs"], su["deaths"], su["chars"], su["dungeons"],
+                 fmt_sec(su["avg_sec"]))]
+    if tops:
+        lines.append("")
+        lines.append("副本场次 Top：")
+        for t in tops:
+            lines.append("  %-16s %3d 场  %4d 死  %s" % (
+                t["name"][:14], t["runs"], t["deaths"], fmt_sec(t["avg_sec"])))
+    if dt["by_role"]:
+        lines.append("")
+        lines.append("死亡 Top：")
+        for d in dt["by_role"][:6]:
+            if d["deaths"]:
+                lines.append("  %-10s %d 死 / %d 场" % (d["role"], d["deaths"], d["runs"]))
+    return lines
+
+
+def cmd_items(args):
+    st = report.Store(db_of(args))
+    s, e, label = report.range_of(args.range)
+    rows = st.item_rank(s, e, limit=args.limit)
+    st.close()
+    lines = ["%s 道具排行（item1+item2）" % label]
+    if not rows:
+        lines.append("  （无）")
+    for r in rows:
+        lines.append("  %-26s ×%-6d 出现在 %d 场" % (
+            r["name"][:24], r["qty"] or r["runs"], r["runs"]))
+    return lines
+
+
+def cmd_eff(args):
+    st = report.Store(db_of(args))
+    s, e, label = report.range_of(args.range)
+    rows = st.efficiency(s, e)
+    st.close()
+    lines = ["%s 副本效率（按经验/分钟）" % label]
+    lines.append(pad("副本", 18) + pad("场次", 6, ">") + pad("死亡", 6, ">")
+                 + pad("均耗时", 9, ">") + pad("均经验", 8, ">") + pad("经验/分", 9, ">"))
+    for r in rows:
+        lines.append(pad(r["dungeon"][:16], 18) + pad(r["runs"], 6, ">")
+                     + pad(r["deaths"], 6, ">") + pad(fmt_sec(r["avg_sec"]), 9, ">")
+                     + pad(r["exp_avg"], 8, ">") + pad(r["exp_per_min"], 9, ">"))
+    return lines
+
+
+def cmd_daily(args):
+    st = report.Store(db_of(args))
+    s, e = rng("week", args.offset)
+    rows = st.daily(s, e)
+    st.close()
+    lines = ["按天（%s ~ %s）" % (datetime.fromtimestamp(s).strftime("%m-%d"),
+                                 datetime.fromtimestamp(e).strftime("%m-%d"))]
+    for r in rows:
+        lines.append("  %s  场次 %3d  死亡 %2d" % (r["date"], r["runs"], r["deaths"]))
+    return lines
+
+
+def cmd_export(args):
+    st = report.Store(db_of(args))
+    s, e = rng(args.range, args.offset)
+    mx = st.matrix_strict(s, e, with_diff=args.by_diff,
+                          limits=recordini.load_limits(),
+                          orders=recordini.load_role_orders(),
+                          blocked=recordini.load_blocked())
+    st.close()
+    cols = mx["cols"]
+    out = args.out or "report.csv"
+    with open(out, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["角色"] + ["%s(/%d)" % (c["name"], c["limit"]) for c in cols])
+        for r in mx["rows"]:
+            line = [r["role"]]
+            for c in cols:
+                cell = mx["cells"].get("%s|%s" % (r["role"], c["key"]))
+                line.append(cell["runs"] if cell else 0)
+            w.writerow(line)
+        w.writerow([])
+        w.writerow(["合计", mx["totals"]["runs"], "死亡", mx["totals"]["deaths"]])
+    return ["已导出：%s（%d 角色 × %d 副本）" % (
+        os.path.abspath(out), len(mx["rows"]), len(cols))]
+
+
+# --------------------------------------------------------------------------
+
+def cmd_roleid(args):
+    """
+    角色数字ID清单 / 手打备注。
+      python -m dungeon roleid
+      python -m dungeon roleid --set 13183=元素
+    备注存 data/role_remarks.json；报表优先显示备注。
+    """
+    from . import syncdb, modules as md
+    if args.set:
+        pid, _, name = args.set.partition("=")
+        syncdb.set_remark(pid.strip(), name.strip())
+        return ["已保存：%s → %s" % (pid.strip(), name.strip() or "（已清空）"),
+                "文件：%s" % syncdb._REMARK_FILE]
+
+    rows = syncdb.roles()
+    if not rows:
+        return ["没有找到 SynchroDB/*.syn（检查 樱桃\\data\\SynchroDB）"]
+    body = [[r["player"], r["label"] or "（未备注）", str(r["indun"]),
+             str(r["dress"]), str(r["items"])] for r in rows]
+    lines = md.table(["数字ID", "备注", "已打", "装备", "物品"], body,
+                     ["<", "<", ">", ">", ">"])
+    return ["角色数字ID（来源 data\\SynchroDB\\*.syn，共 %d 个）" % len(rows), ""] + lines + [
+        "",
+        "手打备注：python -m dungeon roleid --set <数字ID>=<角色名>"]
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        prog="dungeon", description="副本统计（对齐 龙猫站团本小精灵 v6.5 口径）")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def common(sp):
+        sp.add_argument("--db", default="")
+        sp.add_argument("--out", default="")
+        sp.add_argument("--source", default="all", choices=["all", "cherry", "tobo"])
+        sp.add_argument("--by-diff", action="store_true")
+
+    sp = sub.add_parser("sync", help="建库/增量")
+    common(sp)
+    sp.add_argument("--full", action="store_true")
+    sp.add_argument("--days", type=int, default=2)
+    sp.add_argument("--with-drops", action="store_true")
+    sp.set_defaults(func=cmd_sync)
+
+    sp = sub.add_parser("week")
+    common(sp)
+    sp.add_argument("--offset", type=int, default=None)
+    sp.add_argument("--cols", type=int, default=8)
+    sp.set_defaults(func=cmd_week)
+
+    for name, fn in (("summary", cmd_summary), ("items", cmd_items),
+                     ("eff", cmd_eff), ("daily", cmd_daily), ("export", cmd_export)):
+        sp = sub.add_parser(name)
+        common(sp)
+        sp.add_argument("--range", default="week", choices=["today", "week", "lastweek"])
+        sp.add_argument("--offset", type=int, default=None)
+        if name == "items":
+            sp.add_argument("--limit", type=int, default=30)
+        sp.set_defaults(func=fn)
+
+    sp = sub.add_parser("roleid", help="角色数字ID / 手打备注")
+    common(sp)
+    sp.add_argument("--set", default="", help="格式 <数字ID>=<备注>")
+    sp.set_defaults(func=cmd_roleid)
+
+    args = p.parse_args(argv)
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    lines = args.func(args)
+    text = "\n".join(str(x) for x in lines)
+    print(text)
+    o = getattr(args, "out", "")
+    if o and args.cmd != "export":
+        with open(o, "w", encoding="utf-8") as f:
+            f.write(text)
+        print("\n已写入：%s" % os.path.abspath(o))
+
+
+if __name__ == "__main__":
+    main()

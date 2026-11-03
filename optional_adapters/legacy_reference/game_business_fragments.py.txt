@@ -1,0 +1,1194 @@
+# Archived business fragments, reference only. Not a runnable plugin; dependencies intentionally not loaded.
+
+# Original guard_bot.py:867
+def scan_wegame_accounts():
+    """
+    自动识别「WeGame 托盘昵称 ↔ wegame.exe 进程」：
+      ① EnumWindows 找每个实例的 TGP_TRAYICON_NEW 窗口
+      ② Shell_NotifyIconGetRect(hwnd, uid) 拿它在托盘上的图标矩形
+      ③ UI Automation 读托盘按钮的 tooltip（WeGame: 昵称）
+      ④ 按矩形一致配对 → [{pid, nickname, rect}]
+    实测（2026-10-29）：懒洋洋=16012、游戏1=17816、临界=15388、名媛=11836
+    """
+    out = []
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+
+        class _NID(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("hWnd", wintypes.HWND),
+                        ("uID", wintypes.UINT), ("guidItem", ctypes.c_byte * 16)]
+
+        shell32.Shell_NotifyIconGetRect.argtypes = [ctypes.POINTER(_NID),
+                                                    ctypes.POINTER(wintypes.RECT)]
+        shell32.Shell_NotifyIconGetRect.restype = ctypes.c_long
+
+        icons = []
+        proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def _cb(hwnd, lparam):
+            try:
+                n = user32.GetWindowTextLengthW(hwnd)
+                if n <= 0:
+                    return True
+                buf = ctypes.create_unicode_buffer(n + 1)
+                user32.GetWindowTextW(hwnd, buf, n + 1)
+                if "TRAYICON" not in buf.value.upper():
+                    return True
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                for uid in range(0, 6):
+                    nid = _NID()
+                    nid.cbSize = ctypes.sizeof(_NID)
+                    nid.hWnd = hwnd
+                    nid.uID = uid
+                    rc = wintypes.RECT()
+                    if shell32.Shell_NotifyIconGetRect(ctypes.byref(nid),
+                                                       ctypes.byref(rc)) == 0:
+                        icons.append((pid.value,
+                                      (int(rc.left), int(rc.top),
+                                       int(rc.right), int(rc.bottom))))
+                        break
+            except Exception:
+                pass
+            return True
+
+        user32.EnumWindows(proto(_cb), 0)
+        if not icons:
+            return out
+
+        tips = {}
+        try:
+            import uiautomation as auto
+            tray = auto.PaneControl(searchDepth=1, ClassName="Shell_TrayWnd")
+            notify = auto.PaneControl(searchFromControl=tray, searchDepth=2,
+                                      ClassName="TrayNotifyWnd")
+            pager = auto.PaneControl(searchFromControl=notify, searchDepth=2,
+                                     ClassName="SysPager")
+            bar = auto.Control(searchFromControl=pager, searchDepth=2,
+                               ClassName="ToolbarWindow32")
+            for btn in bar.GetChildren():
+                nm = (btn.Name or "").strip()
+                if not nm:
+                    continue
+                r = btn.BoundingRectangle
+                tips[(int(r.left), int(r.top), int(r.right), int(r.bottom))] = nm
+        except Exception as e:
+            log.warning("读取托盘 tooltip 失败（WeGame 昵称不可用）：%s", e)
+
+        for pid, rect in icons:
+            nickname = ""
+            for box, nm in tips.items():
+                if abs(box[0] - rect[0]) <= 2 and abs(box[1] - rect[1]) <= 2:
+                    nickname = re.sub(r"^WeGame\s*[:：]\s*", "", nm).strip()
+                    break
+            out.append({"pid": pid, "nickname": nickname, "rect": list(rect)})
+    except Exception as e:
+        log.warning("扫描 WeGame 账号失败：%s", e)
+    return out
+
+# Original guard_bot.py:962
+def scan_cherry_roles():
+    """
+    樱桃/心月狐：Data\\Config\\<账户ID>\\<角色hex>\\ 下有一个 **0 字节文件，文件名就是角色名**
+    （实测：783912364\\D7D4C8F4\\ 里有 0 字节文件「自若」，还有 元素.jn / 雨伞.jn 职业文件）
+    """
+    out = []
+    cfg = os.path.join(DUN_ROOT, "Data", "Config") if DUN_ROOT else ""
+    if not cfg or not os.path.isdir(cfg):
+        return out
+    try:
+        accounts = list(os.scandir(cfg))
+    except OSError:
+        return out
+    for acc in accounts:
+        if not acc.is_dir():
+            continue
+        try:
+            roles = list(os.scandir(acc.path))
+        except OSError:
+            continue
+        for role in roles:
+            if not role.is_dir():
+                continue
+            name = ""
+            try:
+                for f in os.scandir(role.path):
+                    if not f.is_file():
+                        continue
+                    if f.name.startswith("(系统)") or f.name.lower().endswith(
+                            (".lua", ".save", ".dat", ".jn", ".json")):
+                        continue
+                    if f.stat().st_size == 0:
+                        name = f.name
+                        break
+            except OSError:
+                continue
+            if name:
+                out.append({"name": name.strip(), "source": "cherry",
+                            "account": acc.name})
+    return out
+
+# Original guard_bot.py:1004
+def scan_tobo_roles():
+    """土拨鼠：save\\<区服>\\<账户>.pt\\<角色名>@<hex>\\ — @ 前就是角色名"""
+    out = []
+    if not TBS_ROOT or not os.path.isdir(TBS_ROOT):
+        return out
+    try:
+        servers = list(os.scandir(TBS_ROOT))
+    except OSError:
+        return out
+    for sv in servers:
+        if not sv.is_dir():
+            continue
+        try:
+            accounts = list(os.scandir(sv.path))
+        except OSError:
+            continue
+        for acc in accounts:
+            if not acc.is_dir():
+                continue
+            try:
+                roles = list(os.scandir(acc.path))
+            except OSError:
+                continue
+            for role in roles:
+                if not role.is_dir() or "@" not in role.name:
+                    continue
+                nm = role.name.split("@")[0].strip()
+                if nm:
+                    out.append({"name": nm, "source": "tobo",
+                                "account": acc.name, "server": sv.name})
+    return out
+
+# Original guard_bot.py:1350
+def _wegame_windows():
+    """
+    可见的 WeGame 界面窗口 → [(hwnd, browser_pid, wegame_pid, rect)]
+    WeGame 的界面是 browser.exe 子进程渲染，父进程才是 wegame.exe（实测 4 个账号全靠这条链区分）
+    """
+    out = []
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def _ppid(pid):
+            # 用 NtQueryInformationProcess 太重，这里直接读 Win32 工具的父子关系表
+            return _PPID_CACHE.get(pid, 0)
+
+        def _cb(hwnd, lparam):
+            try:
+                n = user32.GetWindowTextLengthW(hwnd)
+                if n <= 0:
+                    return True
+                buf = ctypes.create_unicode_buffer(n + 1)
+                user32.GetWindowTextW(hwnd, buf, n + 1)
+                if buf.value.lower() != "wegame":
+                    return True
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                r = wintypes.RECT()
+                if not user32.GetWindowRect(hwnd, ctypes.byref(r)):
+                    return True
+                if r.right - r.left < 600:
+                    return True
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                wp = 0
+                p = pid.value
+                for _ in range(4):          # browser.exe → wegame.exe
+                    p = _ppid(p)
+                    if not p:
+                        break
+                    nm = _pid_exe_name(p)
+                    if "wegame" in nm:
+                        wp = p
+                        break
+                out.append((int(hwnd), pid.value, wp,
+                            (int(r.left), int(r.top), int(r.right), int(r.bottom))))
+            except Exception:
+                pass
+            return True
+
+        user32.EnumWindows(proto(_cb), 0)
+    except Exception as e:
+        log.warning("枚举 WeGame 窗口失败：%s", e)
+    return out
+
+# Original guard_bot.py:1517
+def wegame_launch(target, dry_run=False):
+    """
+    自动重连第 1~3 步：
+      ① 激活对应 WeGame（按昵称或 wegame.exe pid）
+      ② 截图确认在「彩虹岛Online」页面
+      ③ 点击「启动」按钮
+    返回 {"ok":bool, "step":str, "msg":str, "score":float}
+    """
+    global _PPID_CACHE
+    try:
+        import cv2
+        import numpy as np
+    except Exception as e:
+        return {"ok": False, "step": "init", "msg": "缺少 cv2：%s" % e}
+
+    page_tpl_path = _resolve_template("wg_page.png")
+    start_tpl_path = _resolve_template("wg_start.png")
+    if not os.path.isfile(page_tpl_path) or not os.path.isfile(start_tpl_path):
+        return {"ok": False, "step": "init",
+                "msg": "缺少模板 wg_page.png / wg_start.png"}
+
+    page_tpl = cv2.imdecode(np.fromfile(page_tpl_path, dtype=np.uint8),
+                            cv2.IMREAD_COLOR)
+    start_tpl = cv2.imdecode(np.fromfile(start_tpl_path, dtype=np.uint8),
+                             cv2.IMREAD_COLOR)
+
+    # ① 定位目标 wegame.exe pid
+    pid = 0
+    nick = ""
+    if isinstance(target, int) or str(target).isdigit():
+        pid = int(target)
+    else:
+        nick = str(target).strip()
+        for a in scan_wegame_accounts():
+            if a.get("nickname") == nick:
+                pid = a["pid"]
+                break
+    if not pid:
+        return {"ok": False, "step": "find", "msg": "找不到该账号的 wegame.exe"}
+
+    # ② 找它的界面窗口；没有就双击托盘图标把它唤出来（WeGame 多开只显示活动账号窗口）
+    _refresh_ppid_cache()
+    cands = [w for w in _wegame_windows() if w[2] == pid]
+    if not cands and not dry_run:
+        acc = next((a for a in scan_wegame_accounts() if a["pid"] == pid), None)
+        if acc and acc.get("rect"):
+            l, t, r, b = acc["rect"]
+            cx0, cy0 = (l + r) // 2, (t + b) // 2
+            log.info("WeGame 窗口未显示，双击托盘图标唤出：%r (%d,%d)", nick, cx0, cy0)
+            okc, _ = _click_screen(cx0, cy0)
+            time.sleep(0.12)
+            okc2, _ = _click_screen(cx0, cy0)
+            if not (okc or okc2):
+                return {"ok": False, "step": "tray",
+                        "msg": "双击托盘图标失败（需管理员权限）"}
+            time.sleep(1.6)
+        _refresh_ppid_cache(force=True)
+        cands = [w for w in _wegame_windows() if w[2] == pid]
+    if not cands:
+        return {"ok": False, "step": "window",
+                "msg": "找不到 WeGame 界面窗口（是否未登录/已最小化）"}
+    if len(cands) != 1:
+        return {"ok": False, "step": "window", "msg": "匹配到多个窗口，请先明确目标"}
+    hwnd, bpid, wpid, rect = cands[0]
+
+    # ③ 激活（预览只读取后台窗口画面）
+    ok, fg = (True, hwnd) if dry_run else _activate_window(hwnd)
+    time.sleep(0.8)
+    if fg != hwnd:
+        ok, fg = _activate_window(hwnd)
+        time.sleep(0.8)
+    if fg != hwnd:
+        return {"ok": False, "step": "activate",
+                "msg": "无法置前台（当前前台 hwnd=%d），请手动点一下 WeGame" % fg}
+
+    # ④ 截图 + 确认页面
+    r = _window_bbox(hwnd) or rect
+    img = _grab_window(hwnd) if dry_run else _grab_region(r)
+    if img is None:
+        return {"ok": False, "step": "grab", "msg": "截图失败"}
+    bgr = np.array(img.convert("RGB"))[:, :, ::-1].copy()
+
+    hit = _match_color(bgr, page_tpl, 0.85)
+    if not hit:
+        return {"ok": False, "step": "page",
+                "msg": "当前不在「彩虹岛Online」页面，请先在 WeGame 里打开彩虹岛详情页"}
+    score_page = hit[0]
+
+    hit2 = _match_color(bgr, start_tpl, 0.85)
+    if not hit2:
+        return {"ok": False, "step": "start", "score": score_page,
+                "msg": "没找到「启动」按钮（可能已在运行中）"}
+
+    sx, sy = hit2[1]
+    tw, th = hit2[2], hit2[3]
+    cx = r[0] + sx + tw // 2
+    cy = r[1] + sy + th // 2
+    if dry_run:
+        return {"ok": True, "step": "dry", "score": score_page,
+                "msg": "（演练）页面匹配 %.3f，启动按钮在 (%d,%d)" % (score_page, cx, cy)}
+    before_total, before_items = scan_game_processes()
+    if before_total < 0:
+        return {"ok": False, "step": "process", "msg": "无法读取进程基线，已停止启动操作"}
+    before_pids = {it["pid"] for it in before_items}
+    cok, cmsg = _msg_click(hwnd, cx, cy)
+    if not cok:
+        cok, cmsg = _click_screen(cx, cy, hwnd)
+    if not cok:
+        return {"ok": False, "step": "click", "score": score_page,
+                "msg": "点击启动按钮失败：%s" % cmsg}
+
+    # ⑤ 只把该 WeGame 新产生的目标进程当作启动结果。
+    t0 = time.time()
+    seen = False
+    while time.time() - t0 < 40:
+        time.sleep(2)
+        try:
+            total, items = scan_game_processes()
+            if total > 0:
+                _refresh_ppid_cache(force=True)
+                def belongs(item):
+                    ancestor = item["pid"]
+                    for _ in range(12):
+                        ancestor = _PPID_CACHE.get(ancestor, 0)
+                        if ancestor == pid:
+                            return True
+                        if not ancestor:
+                            break
+                    return False
+                if any(it["pid"] not in before_pids and belongs(it) for it in items):
+                    seen = True
+                    break
+        except Exception:
+            pass
+    return {"ok": seen, "step": "launched" if seen else "timeout", "score": score_page,
+            "msg": "已点击启动%s" % ("，游戏进程已出现" if seen else "（等待游戏进程超时）"),
+            "hwnd": hwnd, "pid": pid, "nickname": nick}
+
+# Original guard_bot.py:1769
+def select_role(role, max_scrolls=3, dry_run=False, target_pid=None):
+    """
+    选角界面 OCR 找角色并点击：
+      ① 激活游戏窗口 → ② 截图 OCR → ③ 匹配角色名（容错）
+      → ④ 点文字上方头像格 → ⑤ 没找到就滚轮下滑重试（最多 max_scrolls 次）
+    """
+    role = str(role or "").strip()
+    if not role:
+        return {"ok": False, "msg": "角色名为空"}
+
+    hwnd, rect = find_game_window(target_pid)
+    if not hwnd:
+        return {"ok": False, "msg": "找不到游戏窗口（游戏没开或已最小化）"}
+
+    ok, fg = (True, hwnd) if dry_run else _activate_window(hwnd)
+    time.sleep(0.9 if not dry_run else 0)
+    if fg != hwnd:
+        ok, fg = _activate_window(hwnd)
+        time.sleep(0.9)
+    if fg != hwnd:
+        return {"ok": False, "msg": "无法把游戏窗口置前台（前台 hwnd=%d）" % fg}
+
+    r = _window_bbox(hwnd) or rect
+    tries = []
+    for i in range((0 if dry_run else max_scrolls) + 1):
+        img = _grab_window(hwnd) if dry_run else _grab_region(r)
+        if img is None:
+            return {"ok": False, "msg": "截图失败", "tries": tries}
+        try:
+            texts = ocr_pil(img)
+        except Exception as e:
+            return {"ok": False, "msg": "OCR 失败：%s" % e, "tries": tries}
+
+        hit = None
+        for t in texts:
+            if _name_similar(t["text"], role):
+                hit = t
+                break
+        tries.append({"round": i, "texts": len(texts),
+                      "sample": [t["text"] for t in texts[:8]],
+                      "hit": hit["text"] if hit else ""})
+
+        if hit:
+            h = r[3] - r[1]
+            cx = int(r[0] + hit["cx"])
+            cy = int(r[1] + hit["cy"] - h * 0.085)   # 文字上方就是头像格
+            if dry_run:
+                return {"ok": True, "msg": "（演练）在第 %d 屏找到「%s」，应点 (%d,%d)"
+                        % (i + 1, hit["text"], cx, cy), "tries": tries}
+            cok, cmsg = _msg_click(hwnd, cx, cy)
+            if not cok:
+                cok, cmsg = _click_screen(cx, cy, hwnd)
+            if not cok:
+                return {"ok": False, "msg": "找到角色但点击失败：%s" % cmsg,
+                        "tries": tries}
+            return {"ok": True, "msg": "已选择角色「%s」（第 %d 屏）" % (hit["text"], i + 1),
+                    "tries": tries, "clicked": [cx, cy]}
+
+        if not dry_run and i < max_scrolls:
+            _wheel_at(r[0] + (r[2] - r[0]) // 2, r[1] + (r[3] - r[1]) // 2, -3)
+            time.sleep(1.0)
+
+    return {"ok": False,
+            "msg": "滚动了 %d 次仍未找到角色「%s」，OCR 看到：%s"
+                   % (max_scrolls, role,
+                      "、".join((tries[-1]["sample"] if tries else [])[:8])),
+            "tries": tries}
+
+# Original guard_bot.py:1915
+class StuckWatcher(threading.Thread):
+    """
+    卡本检测：读动物 log.db 的最后一条日志时间
+      * 超过 stuck_notify.timeout 秒没有任何动作 → 判定卡住，推送「卡在哪个地图」
+      * 恢复动作后再推一条「已恢复」
+    只用辅助自己的日志，不碰游戏客户端日志。
+    """
+
+    def __init__(self):
+        super().__init__(daemon=True, name="stuck")
+        self.stop_event = threading.Event()
+        self.state = {}          # role -> {pushed_at, map, last_ts}
+        self.recent = []         # 面板展示用
+
+    def stop(self):
+        self.stop_event.set()
+
+    def run(self):
+        log.info("卡本检测已启动（阈值 %d 秒，来源：动物 log.db）", STUCK_TIMEOUT)
+        while not self.stop_event.wait(60):
+            try:
+                self.check()
+            except Exception as e:
+                log.warning("卡本检测异常：%s", e)
+
+    def check(self):
+        if not STUCK_ENABLED:
+            return
+        try:
+            total, _items = scan_game_processes()
+            if total == 0:
+                self.state.clear()
+                return
+            if total < 0:
+                return
+        except Exception:
+            pass
+        now = time.time()
+        # 只检查最近 15 分钟内还在写日志的角色（说明辅助正在跑）；否则会误报"卡了一天"
+        for role, logdb in _iter_tbs_logdbs(max_age=max(900, STUCK_TIMEOUT + STUCK_COOLDOWN + 120)):
+            info = _tbs_last_log(logdb)
+            if not info:
+                continue
+            ts, action, detail, mapname = info
+            if not ts:
+                continue
+            idle = now - ts / 1000.0
+            st = self.state.setdefault(role, {"pushed_at": 0.0, "map": "", "last_ts": 0})
+            st["last_ts"] = ts
+            if idle >= STUCK_TIMEOUT:
+                if st["pushed_at"] and now - st["pushed_at"] < STUCK_COOLDOWN:
+                    continue
+                st["pushed_at"] = now
+                st["map"] = mapname
+                self.recent.append({"ts": time.strftime("%H:%M:%S"), "role": role,
+                                    "map": mapname, "idle": int(idle), "ok": False})
+                self.recent = self.recent[-30:]
+                self._push_stuck(role, mapname, idle, action, detail, ts)
+            else:
+                if st["pushed_at"]:
+                    self.recent.append({"ts": time.strftime("%H:%M:%S"), "role": role,
+                                        "map": mapname, "idle": int(idle), "ok": True})
+                    self.recent = self.recent[-30:]
+                    self._push_recovered(role, mapname)
+                    st["pushed_at"] = 0.0
+
+    def _push_stuck(self, role, mapname, idle, action, detail, ts):
+        if role and not is_role_monitored(role):
+            log.info("卡住但该账号未开启监控，跳过：%s", role)
+            return
+        if not BOT_NOTIFIER:
+            return
+        lines = ["⚠️ 可能卡住了｜%s%s" % (role, _account_suffix(role))]
+        if mapname:
+            lines.append("📍 卡在「%s」" % mapname)
+        lines.append("⏱ 已 %s 没有任何动作" % _fmt_sec(idle))
+        try:
+            lines.append("🕐 最后动作 %s：%s" % (
+                datetime.fromtimestamp(ts / 1000.0).strftime("%H:%M:%S"),
+                (action or "") + (("｜" + detail) if detail else "")))
+        except Exception:
+            pass
+        lines.append("👉 请查看游戏画面，或手动重连")
+        BOT_NOTIFIER(lines, "stuck")
+
+    def _push_recovered(self, role, mapname):
+        if not BOT_NOTIFIER:
+            return
+        txt = "✅ 已恢复动作｜%s%s" % (role, _account_suffix(role))
+        if mapname:
+            txt += "（%s）" % mapname
+        BOT_NOTIFIER([txt], "stuck")
+
+# Original guard_bot.py:2204
+class GameWatch(threading.Thread):
+    """
+    每 interval 秒：
+      ① 查每个 LaTaleClient 进程的 TCP 长连接 —— 断线 = 疑似网络中断
+      ② 增量读游戏客户端日志（LataleOnline\\log\\Log_*.txt）
+         - Stage[N] MapGroup[N] 变化 = 换地图
+         - 长时间无新行 = 卡住/掉线
+    """
+
+    def __init__(self):
+        super().__init__(daemon=True, name="gamewatch")
+        self.logs = {}      # path -> 状态
+        self.pids = {}      # pid -> 状态
+        self.stop_flag = threading.Event()
+
+    # ---------------- 日志文件 ----------------
+
+    def _iter_logs(self):
+        try:
+            entries = list(os.scandir(GLOG_DIR))
+        except OSError as e:
+            log.warning("扫描游戏日志失败：%s", e)
+            return
+        for f in entries:
+            n = f.name.lower()
+            if (f.is_file() and n.startswith("log_") and n.endswith(".txt")
+                    and not n.startswith("syslog")):
+                yield f.path
+
+    def _log_state(self, path):
+        return self.logs.setdefault(path, {
+            "offset": 0,
+            "last_line": 0.0,
+            "stage": None,        # (stage, mapgroup)
+            "stage_since": 0.0,
+            "idle_alerted": False,
+            "stage_alerted": False,
+        })
+
+    def _tail_stage(self, path):
+        try:
+            size = os.path.getsize(path)
+            with open(path, "rb") as f:
+                f.seek(max(0, size - 65536))
+                tail = f.read().decode("gbk", errors="replace")
+        except OSError:
+            return None
+        ms = STAGE_RE.findall(tail)
+        if not ms:
+            return None
+        s, g = ms[-1]
+        return (int(s), int(g))
+
+    def _read_chunk(self, path, st, size):
+        try:
+            with open(path, "rb") as f:
+                f.seek(st["offset"])
+                data = f.read(max(0, size - st["offset"]))
+        except OSError:
+            return ""
+        if not data:
+            return ""
+        idx = data.rfind(b"\n")          # 只处理完整行，半行留给下次
+        if idx < 0:
+            return ""
+        data = data[:idx + 1]
+        st["offset"] += len(data)
+        return data.decode("gbk", errors="replace")
+
+    # ---------------- 基线 ----------------
+
+    def _baseline(self):
+        now = time.time()
+        n = 0
+        for p in self._iter_logs():
+            st = self._log_state(p)
+            try:
+                st["offset"] = os.path.getsize(p)
+            except OSError:
+                continue
+            st["last_line"] = now
+            st["stage"] = self._tail_stage(p)
+            st["stage_since"] = now
+            n += 1
+        log.info("游戏日志基线：%d 个文件，当前地图 %s",
+                 n, self._stage_desc())
+
+    def _stage_desc(self):
+        for p in sorted(self.logs, key=lambda x: self.logs[x]["last_line"],
+                        reverse=True):
+            st = self.logs[p]
+            if st["stage"]:
+                return "Stage[%d] MapGroup[%d]" % st["stage"]
+        return "未知"
+
+    def _current_stage(self):
+        for p in sorted(self.logs, key=lambda x: self.logs[x]["last_line"],
+                        reverse=True):
+            if self.logs[p]["stage"]:
+                return self.logs[p]["stage"]
+        return None
+
+    # ---------------- 主循环 ----------------
+
+    def run(self):
+        if not GLOG_ENABLED:
+            log.info("游戏日志/网络监控已关闭（monitor_config.json → game_log.enabled）")
+            return
+        if not GLOG_DIR or not os.path.isdir(GLOG_DIR):
+            log.warning("游戏日志目录不存在：%s（请检查 game_log.dir）", GLOG_DIR)
+            return
+
+        log.info("游戏日志监控启动：%s｜每 %d 秒｜网络 %ds / 静默 %ds / 地图 %ds",
+                 GLOG_DIR, GLOG_INTERVAL, GLOG_NET_TIMEOUT,
+                 GLOG_IDLE_TIMEOUT, GLOG_STAGE_TIMEOUT)
+        self._baseline()
+        while not self.stop_flag.is_set():
+            try:
+                self._scan()
+            except Exception:
+                log.exception("游戏日志扫描异常（继续下一轮）")
+            self.stop_flag.wait(GLOG_INTERVAL)
+
+    def _scan(self):
+        now = time.time()
+
+        # ---------- ① 进程网络状态 ----------
+        total, items = scan_game_processes()
+        if total >= 0:
+            conn = _tcp_established_counts()
+            if conn is not None:
+                alive = set()
+                for it in items:
+                    pid = it["pid"]
+                    alive.add(pid)
+                    role = _role_from_title(it.get("title"))
+                    st = self.pids.setdefault(pid, {
+                        "role": role, "off_since": None, "alerted": False})
+                    if role:
+                        st["role"] = role
+
+                    if conn.get(pid, 0) > 0:
+                        st["off_since"] = None
+                        if st["alerted"]:
+                            st["alerted"] = False
+                            self._push_net_recovered(st, pid)
+                    else:
+                        if st["off_since"] is None:
+                            st["off_since"] = now
+                        elif (now - st["off_since"] >= GLOG_NET_TIMEOUT
+                              and not st["alerted"]):
+                            st["alerted"] = True
+                            self._push_net_lost(st, pid, now - st["off_since"])
+                for pid in list(self.pids):
+                    if pid not in alive:
+                        self.pids.pop(pid, None)
+
+        # ---------- ② 日志增量解析 ----------
+        for p in self._iter_logs():
+            st = self._log_state(p)
+            try:
+                size = os.path.getsize(p)
+            except OSError:
+                continue
+            if size < st["offset"]:                 # 文件被重建
+                st.update(offset=0, stage=None, stage_since=now,
+                          idle_alerted=False, stage_alerted=False)
+            if size > st["offset"]:
+                chunk = self._read_chunk(p, st, size)
+                if chunk:
+                    st["last_line"] = now
+                    ms = STAGE_RE.findall(chunk)
+                    if ms:
+                        s, g = ms[-1]
+                        new_stage = (int(s), int(g))
+                        if new_stage != st["stage"]:
+                            log.info("换地图：%s → Stage[%d] MapGroup[%d]（%s）",
+                                     "Stage[%d]" % st["stage"][0] if st["stage"] else "无",
+                                     new_stage[0], new_stage[1], _log_label(p))
+                            st["stage"] = new_stage
+                            st["stage_since"] = now
+                            st["stage_alerted"] = False
+                    if st["idle_alerted"]:
+                        st["idle_alerted"] = False
+                        self._push_log_recovered(st, p)
+
+            # ---------- ③ 卡住 / 地图停留判定 ----------
+            idle = now - (st["last_line"] or now)
+            stage_age = now - (st["stage_since"] or now)
+
+            if idle >= GLOG_IDLE_TIMEOUT and not st["idle_alerted"]:
+                st["idle_alerted"] = True
+                self._push_log_idle(st, p, idle, stage_age)
+            elif (GLOG_STAGE_ALWAYS and st["stage"]
+                  and stage_age >= GLOG_STAGE_TIMEOUT
+                  and not st["stage_alerted"]):
+                st["stage_alerted"] = True
+                self._push_stage_stuck(st, p, stage_age)
+
+    # ---------------- 推送 ----------------
+
+    def _roles_text(self):
+        roles = [st["role"] for st in self.pids.values() if st.get("role")]
+        return "、".join(dict.fromkeys(roles))
+
+    def _push_net_lost(self, st, pid, offline_sec):
+        role = st.get("role") or ""
+        if role and not is_role_monitored(role):
+            log.info("网络中断但该账号未开启监控，跳过：%s", role)
+            return
+        lines = ["🔴 疑似网络中断｜%s%s" % (role or ("PID %d" % pid),
+                                          _qq_suffix(role)),
+                 "游戏进程还在，但 TCP 连接已断开 %s" % _fmt_sec(offline_sec)]
+        stage = self._current_stage()
+        if stage:
+            lines.append("最后地图：Stage[%d] MapGroup[%d]" % stage)
+        lines.append("可能已掉线，请查看游戏画面。")
+        log.warning("网络中断告警：%s", lines[0])
+        HUB.push_to_all("\n".join(lines), cooldown=0, kind="net")
+
+    def _push_net_recovered(self, st, pid):
+        log.info("网络恢复：%s", st.get("role") or pid)
+        HUB.push_to_all("🟢 网络已恢复｜%s\nTCP 连接已重新建立。"
+                        % (st.get("role") or "PID %d" % pid),
+                        cooldown=0, kind="net")
+
+    def _push_log_idle(self, st, path, idle, stage_age):
+        lines = ["🟠 游戏可能卡住｜%s" % _log_label(path),
+                 "游戏日志已 %s 无输出" % _fmt_sec(idle)]
+        if st["stage"]:
+            lines.append("当前地图：Stage[%d] MapGroup[%d]" % st["stage"])
+            if stage_age:
+                lines.append("该地图已停留 %s" % _fmt_sec(stage_age))
+        roles = self._roles_text()
+        if roles:
+            lines.append("在线角色：%s" % roles)
+        lines.append("可能掉线或卡在加载，请查看游戏画面。")
+        log.warning("日志静默告警：%s", lines[0])
+        HUB.push_to_all("\n".join(lines), cooldown=0, kind="stuck")
+
+    def _push_stage_stuck(self, st, path, stage_age):
+        lines = ["🟡 地图停留超时｜%s" % _log_label(path),
+                 "同一地图已停留 %s 未切换" % _fmt_sec(stage_age),
+                 "当前地图：Stage[%d] MapGroup[%d]" % st["stage"]]
+        roles = self._roles_text()
+        if roles:
+            lines.append("在线角色：%s" % roles)
+        HUB.push_to_all("\n".join(lines), cooldown=0, kind="stuck")
+
+    def _push_log_recovered(self, st, path):
+        txt = "🟢 游戏日志恢复输出｜%s" % _log_label(path)
+        if st["stage"]:
+            txt += "\n当前地图：Stage[%d] MapGroup[%d]" % st["stage"]
+        log.info("日志恢复：%s", path)
+        HUB.push_to_all(txt, cooldown=0, kind="stuck")
+
+# Original guard_bot.py:2692
+class DungeonWatcher(threading.Thread):
+    """
+    轮询 植物\\log\\AutoLog\\<角色>\\<日期>\\*.ini：
+      * 启动时先建基线（已有文件不推送历史）
+      * 之后发现新文件 / 内容变化 → 解析 → 命中副本白名单 → 推送结算
+      * 解析失败会在下一轮重试（防止读到写了一半的文件）
+    """
+
+    def __init__(self):
+        super().__init__(daemon=True, name="dungeon")
+        self.known = {}          # path -> (mtime, size)
+        self.stop_flag = threading.Event()
+        self.today_count = 0     # 本次运行已推送条数
+        self.last = None         # 最近一条推送的记录
+        self.recent = deque(maxlen=20)   # 最近解析到的副本记录（含未推送的）
+
+    # ---------------- 扫描 ----------------
+
+    def _iter_ini(self):
+        """只扫今天/昨天的日期目录（历史 8000+ 文件不碰）"""
+        now = datetime.now()
+        keep = {(now - timedelta(days=1)).strftime("%Y-%m-%d"),
+                now.strftime("%Y-%m-%d")}
+        try:
+            role_iters = list(os.scandir(DUN_AUTOLOG))
+        except OSError as e:
+            log.warning("扫描副本日志失败：%s", e)
+            return
+        for role_dir in role_iters:
+            if not role_dir.is_dir():
+                continue
+            try:
+                day_iters = list(os.scandir(role_dir.path))
+            except OSError:
+                continue
+            for day_dir in day_iters:
+                if not day_dir.is_dir() or day_dir.name not in keep:
+                    continue
+                try:
+                    files = list(os.scandir(day_dir.path))
+                except OSError:
+                    continue
+                for f in files:
+                    if f.is_file() and f.name.lower().endswith(".ini"):
+                        yield f.path
+
+    def _baseline(self):
+        n = 0
+        for p in self._iter_ini():
+            try:
+                st = os.stat(p)
+                self.known[p] = (st.st_mtime, st.st_size)
+                n += 1
+            except OSError:
+                pass
+        log.info("副本监控基线：已有 %d 个记录文件（不推送历史）", n)
+
+    def _scan(self):
+        for p in self._iter_ini():
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            sig = (st.st_mtime, st.st_size)
+            if self.known.get(p) == sig:
+                continue
+            self.known[p] = sig
+            if st.st_size <= 0:
+                continue
+
+            try:
+                rec = parse_dungeon_ini(p)
+            except Exception as e:
+                log.warning("解析副本记录失败（下轮重试）：%s -> %s",
+                            os.path.basename(p), e)
+                self.known.pop(p, None)      # 让下一轮重新尝试
+                continue
+            if not rec:
+                continue
+            if not is_role_monitored(rec["role"]):
+                continue
+            if not _is_dungeon_script(rec["script"]):
+                log.info("跳过非副本脚本：%s（%s）", rec["script"], rec["role"])
+                continue
+            if DUN_ONLY_COMPLETE and "执行完毕" not in rec["endmsg"]:
+                log.info("跳过未完成记录：%s（%s）%r",
+                         rec["script"], rec["role"], rec["endmsg"])
+                continue
+
+            text = fmt_dungeon_msg(rec)
+            hits = rec.get("hits") or []
+            self.recent.append({
+                "ts": time.strftime("%H:%M:%S"),
+                "role": rec["role"],
+                "name": rec["script"],
+                "deaths": rec["deaths"],
+                "hits": len(hits),
+                "endmsg": rec["endmsg"][:24],
+                "pushed": bool(text),
+            })
+            if not text:
+                log.info("副本结算无关键道具，不推送：%s / %s（死亡 %d）",
+                         rec["role"], rec["script"], rec["deaths"])
+                continue
+
+            self.today_count += 1
+            self.last = rec
+            log.info("副本结算：%s / %s / 死亡 %d / 关键道具 %d 种 / endmsg=%r",
+                     rec["role"], rec["script"], rec["deaths"],
+                     len(hits), rec["endmsg"])
+            HUB.push_to_all(text, cooldown=DUN_PUSH_COOLDOWN, kind="dungeon")
+
+    # ---------------- 主循环 ----------------
+
+    def run(self):
+        global DUN_NAMES, ROLE_NOTES
+        if not DUN_ENABLED:
+            log.info("副本结算监控已关闭（monitor_config.json → dungeon.enabled）")
+            return
+        if not DUN_AUTOLOG or not os.path.isdir(DUN_AUTOLOG):
+            log.warning("副本日志目录不存在：%s（请检查 dungeon.root）", DUN_AUTOLOG)
+            return
+
+        DUN_NAMES = _load_dungeon_names()
+        ROLE_NOTES = _load_role_notes()
+        log.info("副本监控启动：%s｜每 %d 秒扫描｜白名单 %d 个｜备注 %d 条",
+                 DUN_AUTOLOG, DUN_INTERVAL, len(DUN_NAMES), len(ROLE_NOTES))
+
+        self._baseline()
+        while not self.stop_flag.is_set():
+            try:
+                self._scan()
+            except Exception:
+                log.exception("副本扫描异常（继续下一轮）")
+            self.stop_flag.wait(DUN_INTERVAL)
+
+# Original guard_bot.py:2844
+class TbsWatcher(threading.Thread):
+    """轮询 土拨鼠 save\\...\\Record\\newRecord.db，新副本场次即推送"""
+
+    def __init__(self):
+        super().__init__(daemon=True, name="toboT")
+        self.seen = {}          # db 路径 -> 已处理的最大 InstanceID（保留兼容）
+        self.mtimes = {}        # db 路径 -> 上次 mtime（未变化则跳过）
+        self.done = set()       # 已处理过的 InstanceID（按时间基线捞取，避免大 ID 段漏推）
+        self.base_ts = 0.0
+        self.stop_flag = threading.Event()
+        self.count = 0
+        self.recent = deque(maxlen=20)
+
+    def run(self):
+        if not TBS_ENABLED:
+            log.info("土拨鼠监控已关闭（monitor_config.json → toboT.enabled）")
+            return
+        if not TBS_ROOT or not os.path.isdir(TBS_ROOT):
+            log.warning("土拨鼠目录不存在：%s（请检查 toboT.root）", TBS_ROOT)
+            return
+        log.info("土拨鼠监控启动：%s｜每 %d 秒", TBS_ROOT, TBS_INTERVAL)
+        self._baseline()
+        while not self.stop_flag.is_set():
+            try:
+                self._scan()
+            except Exception:
+                log.exception("动物扫描异常（继续下一轮）")
+            self.stop_flag.wait(TBS_INTERVAL)
+
+    def _baseline(self):
+        self.base_ts = time.time()
+        for db, _role in _iter_tbs_dbs():
+            try:
+                with closing(_tbs_open(db)) as con:
+                    for (iid,) in con.execute("SELECT DISTINCT InstanceID FROM IndunClearRewards"):
+                        self.done.add((os.path.normcase(os.path.abspath(db)), int(iid)))
+            except Exception:
+                log.warning("数据源 B 基线读取失败，下轮重试：%s", os.path.basename(db))
+
+    def _scan(self):
+        now = time.time()
+        for db, role_dir in _iter_tbs_dbs():
+            if _TBS_BAD.get(db, 0) > now:
+                continue
+            con = None
+            try:
+                con = _tbs_open(db)
+                cursor = con.execute(
+                    "SELECT i.InstanceID,i.IndunID,i.Timestamp,i.LastUpdate FROM Instances i "
+                    "WHERE i.LastUpdate >= ? AND EXISTS (SELECT 1 FROM IndunClearRewards r "
+                    "WHERE r.InstanceID=i.InstanceID) ORDER BY i.LastUpdate,i.InstanceID",
+                    (int(self.base_ts),))
+                while True:
+                    batch = cursor.fetchmany(100)
+                    if not batch:
+                        break
+                    for iid, indun, ts, lu in batch:
+                        key = (os.path.normcase(os.path.abspath(db)), int(iid))
+                        if key in self.done:
+                            continue
+                        try:
+                            self._emit(con, db, role_dir, int(iid), int(indun or 0),
+                                       int(ts or 0), int(lu or 0))
+                            self.done.add(key)
+                        except Exception:
+                            log.exception("解析数据源 B 场次失败，下轮重试 iid=%s", iid)
+            except Exception as e:
+                log.warning("数据源 B 扫描失败，下轮重试：%s", e)
+            finally:
+                if con is not None:
+                    con.close()
+
+    def _emit(self, con, db, role_dir, iid, indun, ts, lu):
+        role = role_dir.split("@")[0].strip()
+        if not is_role_monitored(role):
+            self.recent.append({
+                "ts": datetime.fromtimestamp(lu).strftime("%H:%M:%S") if lu else "?",
+                "role": role, "name": "（该账号未开启监控）", "deaths": 0,
+                "hits": 0, "endmsg": "", "pushed": False})
+            return
+        rows = con.execute(
+            "SELECT ItemName, ItemCount FROM IndunClearRewards WHERE InstanceID=?",
+            (iid,)).fetchall()
+        if not rows:
+            rows = con.execute(
+                "SELECT ItemName, ItemCount FROM ItemDrops WHERE InstanceID=?",
+                (iid,)).fetchall()
+        pairs = [(_dec_gbk(n), c) for n, c in rows]
+        hits = filter_key_items(pairs)
+        d = con.execute(
+            "SELECT IFNULL(SUM(DeathCount),0) FROM CharacterDeaths WHERE InstanceID=?",
+            (iid,)).fetchone()[0]
+        deaths = int(d or 0)
+        name = self._instance_name(db, ts, lu) or ("副本#%d" % indun)
+        _notify = should_notify_dungeon({"script": name, "hits": hits})
+        self.recent.append({
+            "ts": datetime.fromtimestamp(lu).strftime("%H:%M:%S") if lu else "?",
+            "role": role,
+            "name": name,
+            "deaths": deaths,
+            "hits": len(hits),
+            "endmsg": "",
+            "pushed": bool(_notify),
+        })
+        if not _notify:
+            log.info("动物场次未命中通知规则，不推送：%s / %s", role, name)
+            return
+
+        dur = ""
+        if ts and lu and lu > ts:
+            sec = lu - ts
+            dur = "%d分%d秒" % (sec // 60, sec % 60)
+        t1 = datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else "?"
+        t2 = datetime.fromtimestamp(lu).strftime("%H:%M:%S") if lu else "?"
+
+        lines = ["🎯 副本通关（动物）｜%s%s" % (role, _qq_suffix(role)),
+                 "📜 %s" % name,
+                 "⏱ " + ((dur + "｜") if dur else "") + ("%s → %s" % (t1, t2)),
+                 "💀 死亡 %d 次" % deaths,
+                 "🎁 关键道具 %d 种：" % len(hits)]
+        for nm, c, _k in hits[:DUN_MAX_ITEMS]:
+            lines.append("· %s ×%d" % (nm, c))
+        if len(hits) > DUN_MAX_ITEMS:
+            lines.append("…另有 %d 种" % (len(hits) - DUN_MAX_ITEMS))
+
+        self.count += 1
+        log.info("动物场次推送：%s / %s / 死亡 %d / 关键道具 %d 种",
+                 role, name, deaths, len(hits))
+        HUB.push_to_all("\n".join(lines), cooldown=DUN_PUSH_COOLDOWN,
+                        kind="dungeon")
+
+    def _instance_name(self, db, ts, lu):
+        """从同角色 log.db 的「进入地图」推断副本名（去数字后缀，排除主城）"""
+        logdb = os.path.join(os.path.dirname(db), "log.db")
+        if not ts or not os.path.isfile(logdb):
+            return None
+        try:
+            con = _tbs_open(logdb)
+            rows = con.execute(
+                "SELECT action, detail FROM debug_logs WHERE timestamp BETWEEN ? AND ?",
+                ((ts - 120) * 1000, (lu + 60) * 1000)).fetchall()
+            con.close()
+        except Exception:
+            return None
+
+        cnt = {}
+        for a, d in rows:
+            try:
+                if _dec_gbk(a) != "进入地图":
+                    continue
+                nm = _dec_gbk(d)
+            except Exception:
+                continue
+            nm = re.sub(r"_\d+$", "", nm)
+            nm = re.sub(r"\d+$", "", nm).strip()
+            if not nm or nm.endswith("城市") or "广场" in nm:
+                continue
+            cnt[nm] = cnt.get(nm, 0) + 1
+        if not cnt:
+            return None
+        return sorted(cnt.items(), key=lambda x: -x[1])[0][0]
+
+# Original guard_bot.py:3376
+class AlertClicker(threading.Thread):
+    """检测断线弹窗并自动点「确定」（默认关闭）"""
+
+    def __init__(self):
+        super().__init__(daemon=True, name="clicker")
+        self.stop_flag = threading.Event()
+        self.last_click = 0.0
+        self.last_score = 0.0
+        self.clicks = 0
+        self.fail_count = 0
+        self.is_admin = False
+        self.last_msg = "未启动"
+
+    def run(self):
+        if not CLICK_ENABLED:
+            self.last_msg = "已关闭（monitor_config.json → auto_click.enabled）"
+            log.info("断线弹窗自动点确定：%s", self.last_msg)
+            return
+        if not os.path.isfile(CLICK_TPL):
+            self.last_msg = "模板不存在：%s" % CLICK_TPL
+            log.warning("断线弹窗自动点确定：%s", self.last_msg)
+            return
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            self.last_msg = "缺少 opencv-python-headless"
+            log.error("断线弹窗自动点确定：%s", self.last_msg)
+            return
+
+        tpl = cv2.imdecode(np.fromfile(CLICK_TPL, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if tpl is None:
+            self.last_msg = "模板读取失败：%s" % CLICK_TPL
+            log.error(self.last_msg)
+            return
+        log.info("断线弹窗自动点确定已启用：模板 %dx%d，阈值 %.2f，间隔 %ds，模式 %s",
+                 tpl.shape[1], tpl.shape[0], CLICK_THRESHOLD, CLICK_INTERVAL,
+                 CLICK_MODE)
+        self.is_admin = _is_admin()
+        if not self.is_admin:
+            log.warning("⚠️ 当前不是管理员：若游戏以管理员运行，点击会被 UIPI 拒绝"
+                        "（日志会显示 err=5），请以管理员身份运行守护")
+
+        while not self.stop_flag.is_set():
+            try:
+                self._tick(tpl)
+            except Exception:
+                log.exception("弹窗检测异常（继续）")
+            self.stop_flag.wait(CLICK_INTERVAL)
+
+    def _tick(self, tpl):
+        now = time.time()
+        if now - self.last_click < CLICK_COOLDOWN:
+            return
+        conn = _tcp_established_counts()
+        for hwnd, pid, title, rect in _enum_game_windows():
+            x, y, w, h = rect
+            if x < -10000 or y < -10000:          # 最小化窗口
+                # 只在"网络异常（无 TCP 连接）"时恢复，避免打扰正常后台号
+                if conn is None or conn.get(pid, 0) > 0:
+                    continue
+                if not _restore_window(hwnd):
+                    continue
+                log.info("网络异常且窗口最小化，已恢复窗口：%s（PID %d）", title, pid)
+                self.last_msg = "已恢复最小化窗口：%s" % title
+                time.sleep(0.5)
+                rect2 = _window_rect(hwnd)
+                if not rect2 or rect2[0] < -10000:
+                    continue
+                x, y, w, h = rect2
+
+            img = _grab_window(hwnd)
+            if img is None or not _is_usable_img(img):
+                img = _grab_screen((x, y, x + w, y + h))
+            if img is None:
+                continue
+
+            bgr = _pil_to_bgr(img)
+            hit = _match_disconnect(bgr, tpl, CLICK_THRESHOLD, CLICK_SCALES)
+            if not hit:
+                continue
+
+            score, (mx, my), tw, th = hit
+            cx = x + mx + CLICK_OFFSET[0] * tw
+            cy = y + my + CLICK_OFFSET[1] * th
+
+            if CLICK_MODE == "sendinput":
+                ok, msg = _click_screen(cx, cy, hwnd)
+            else:
+                ok, msg = _msg_click(hwnd, cx, cy)
+                if not ok and CLICK_MODE == "auto":
+                    ok2, msg2 = _click_screen(cx, cy, hwnd)
+                    msg = "%s → 回退 SendInput：%s" % (msg, msg2)
+                    ok = ok2
+            self.last_score = score
+            self.last_msg = ("已点击 (%d,%d) %s" % (int(cx), int(cy), msg)) if ok else msg
+            if ok:
+                self.clicks += 1
+                self.fail_count = 0
+                self.last_click = now
+                log.info("检测到断线弹窗（%.3f），已点击确定 (%d,%d)｜%s｜%s",
+                         score, int(cx), int(cy), title, msg)
+            else:
+                # 失败也进冷却，避免每 3 秒刷屏；连续 3 次失败暂停 10 分钟
+                self.fail_count += 1
+                self.last_click = now + (600 if self.fail_count >= 3 else 0)
+                log.error("检测到断线弹窗（%.3f）但点击失败：%s｜%s", score, msg, title)
+                if self.fail_count == 3:
+                    log.error("连续 3 次点击失败：请用托盘菜单「以管理员身份重启」"
+                              "（游戏以管理员运行时守护也必须提权），已暂停 10 分钟")
+            return

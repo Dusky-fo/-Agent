@@ -1,0 +1,1105 @@
+"""
+副本报表子系统（独立包，不依赖 guard_bot 的全局状态）
+  parser  → ini 解析（含难度 / 副本别名 / 经验）
+  Store   → SQLite 索引 + 增量同步 + 聚合查询
+  render_* → QQ 指令用的纯文本报表
+"""
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import threading
+import time
+from datetime import datetime, timedelta
+
+ALIAS = {"星之伊甸": "星能之战", "藏宝洞穴": "藏宝洞"}
+DIFF_RE = re.compile(r"\[副本难度=([^\]\"]+)\]")
+DIFF_SUFFIX = re.compile(r"[-－]\s*(简单|普通|困难|炼狱|剧情)\s*$")
+DEFAULT_LIMIT = 7
+# 脚本动作不是副本（实测日志里混着「【存】材料」「执行自动切换角色」「购买HP胶布」等）
+# 注意：不能用「仓库」这类宽泛词 —— 真副本里有「曼赤肯仓库」，会被误杀。
+DUN_NOISE = ("【存】", "执行自动", "购买", "兑换", "存入", "自动修理",
+             "自动出售", "自动存仓", "自动分解", "自动拾取", "整理背包",
+             "自动转换", "自动世界", "自动取出", "切换频道", "领取图腾",
+             "开启图腾", "加入背包")
+
+
+def is_real_dungeon(name):
+    n = (name or "").strip()
+    if len(n) < 2:
+        return False
+    # 以【 …】开头的都是脚本提示词（【存】材料 / 【月活动每日】每日任务 / 【纹章】…）
+    if n[0] in "【(（":
+        return False
+    return not any(k in n for k in DUN_NOISE)
+
+_sync_lock = threading.Lock()
+
+
+# --------------------------------------------------------------------------- #
+# 解析
+# --------------------------------------------------------------------------- #
+def clean(s):
+    if isinstance(s, bytes):
+        try:
+            s = s.decode("gbk")
+        except Exception:
+            s = s.decode("utf-8", errors="replace")
+    return str(s or "").strip()
+
+
+def norm_dungeon(name):
+    n = clean(name)
+    for k, v in ALIAS.items():
+        if k in n:
+            return v
+    return DIFF_SUFFIX.sub("", n).strip() or n
+
+
+def extract_diff(text, script):
+    m = DIFF_RE.search(text or "")
+    if m:
+        return m.group(1).strip()
+    m = DIFF_SUFFIX.search(script or "")
+    return m.group(1) if m else ""
+
+
+def ticks_to_ts(v):
+    """
+    樱桃写的是 Windows FILETIME（100ns since 1601-01-01）。
+
+    ★ 关键：它把「本地时间」直接当作 UTC 编码进 ticks，
+      所以 FromFileTime 会多加一次时区（实测 +8 小时），必须按 naive 本地时间处理。
+
+      实测（2026-10-30 16:35:56 的结算文件）：
+        FromFileTime   → 2026-10-31 00:35:56   ← 错，多 8 小时
+        FromFileTimeUtc→ 2026-10-30 16:35:56   ← 对，等于文件 mtime
+    """
+    try:
+        dt = datetime(1601, 1, 1) + timedelta(microseconds=int(v) // 10)
+        return int(dt.timestamp())      # naive 按本地时区解释，与 mtime 对齐
+    except Exception:
+        return 0
+
+
+def _pairs(v):
+    """
+    兼容三种写法：
+      [{"沉梦花": 3}, ...]      ← 樱桃实际格式（★ 旧版漏了 dict，导致道具统计恒为空）
+      [["名", 3], ...]           ← 兼容
+      ["名", ...]                ← 兼容
+    """
+    out = []
+    for it in (v or []):
+        if isinstance(it, dict):
+            for k, n in it.items():
+                try:
+                    c = int(n)
+                except Exception:
+                    c = 1
+                out.append((clean(k), c))
+        elif isinstance(it, (list, tuple)) and it:
+            try:
+                c = int(it[1]) if len(it) > 1 else 0
+            except Exception:
+                c = 0
+            out.append((clean(it[0]), c))
+        elif isinstance(it, str):
+            out.append((clean(it), 0))
+    return out
+
+
+_ROLE_CACHE = {}
+
+
+def role_name_from_hex(hexid):
+    """
+    角色名 = <樱桃>\\Data\\Config\\<账号>\\<角色hex>\\<0 字节文件名>
+    找不到再退回 GBK 解码（与 guard_bot._role_name_by_hex 同策略）。
+    """
+    hexu = (hexid or "").upper().strip()
+    if not hexu:
+        return ""
+    if hexu in _ROLE_CACHE:
+        return _ROLE_CACHE[hexu]
+    name = ""
+    try:
+        from . import config
+        base = os.path.join(config.cherry_root(), "Data", "Config")
+    except Exception:
+        base = ""
+    if base and os.path.isdir(base):
+        try:
+            for acc in os.scandir(base):
+                if not acc.is_dir():
+                    continue
+                d = os.path.join(acc.path, hexu)
+                if not os.path.isdir(d):
+                    continue
+                try:
+                    for f in os.scandir(d):
+                        if (f.is_file()
+                                and not f.name.startswith("(系统)")
+                                and not f.name.lower().endswith(
+                                    (".lua", ".save", ".dat", ".jn", ".json"))
+                                and f.stat().st_size == 0):
+                            name = f.name.strip()
+                            break
+                except OSError:
+                    pass
+                if name:
+                    break
+        except OSError:
+            pass
+    if not name:
+        try:
+            b = bytes.fromhex(hexu)
+            for enc in ("gbk", "utf-8"):
+                try:
+                    cand = b.decode(enc)
+                except Exception:
+                    continue
+                if all("\u4e00" <= ch <= "\u9fff" or ch.isascii() for ch in cand):
+                    name = cand
+                    break
+        except Exception:
+            pass
+    name = name or hexu
+    _ROLE_CACHE[hexu] = name
+    return name
+
+
+def parse_file(path, resolver=None):
+    """解析一条结算 ini → dict；失败返回 None"""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except Exception:
+        return None
+    if not raw.strip():
+        return None
+    text = raw.decode("gbk", errors="replace")
+    text = "".join(ch for ch in text if ch in "\n\t" or ord(ch) >= 32)
+    try:
+        d = json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+
+    parts = os.path.normpath(path).split(os.sep)
+    hexid = parts[-3] if len(parts) >= 3 else ""
+    role = ""
+    if resolver:
+        try:
+            role = resolver(hexid)
+        except Exception:
+            role = ""
+    if not role:
+        try:
+            b = bytes.fromhex(hexid)
+            # 目录名可能是 GBK hex 也可能是 UTF-8 hex，优先选“像中文”的那个
+            for enc in ("gbk", "utf-8"):
+                try:
+                    cand = b.decode(enc)
+                except Exception:
+                    continue
+                if all("\u4e00" <= ch <= "\u9fff" or ch.isascii() for ch in cand):
+                    role = cand
+                    break
+        except Exception:
+            role = hexid
+    if not role:
+        role = hexid
+
+    script_raw = clean(d.get("name"))
+    dungeon = norm_dungeon(script_raw)
+    if not is_real_dungeon(dungeon):
+        dungeon = ""          # 脚本动作：入库保留但不参与副本统计
+    b_ts = ticks_to_ts(d.get("begintime"))
+    e_ts = ticks_to_ts(d.get("endtime"))
+    dur = max(0, e_ts - b_ts) if (b_ts and e_ts) else 0
+
+    # 经验：只有同等级内的差值才有意义（跨级会重置）
+    bl, el = d.get("beginlevel"), d.get("endlevel")
+    be, ee = d.get("beginexp"), d.get("endexp")
+    exp_gain, level_up = None, 0
+    try:
+        if bl and el:
+            if int(bl) == int(el) and be is not None and ee is not None:
+                exp_gain = max(0, int(ee) - int(be))
+            elif int(el) > int(bl):
+                level_up = 1
+    except Exception:
+        pass
+
+    # 道具只取 item1（通关奖励）/ item2（其他拾取）
+    # card 是翻牌日志文本行（"[翻牌][1][道具名]"），不是结构化数据；
+    # .e 也不解析它，塞进 items 只会污染统计。
+    items = []
+    for bucket in ("item1", "item2"):
+        for nm, qty in _pairs(d.get(bucket)):
+            if nm and qty:
+                items.append((nm, qty, bucket))
+
+    try:
+        st = os.stat(path)
+        mtime, size = st.st_mtime, st.st_size
+    except OSError:
+        mtime, size = 0.0, 0
+    fp = hashlib.sha256(os.path.normcase(os.path.abspath(path)).encode("utf-8")).hexdigest()
+
+
+    return {
+        "fp": fp,
+        "role": role,
+        "role_hex": hexid.upper(),
+        "dungeon": dungeon,
+        "difficulty": extract_diff(text, script_raw),
+        "script_raw": script_raw,
+        "begin_ts": b_ts,
+        "end_ts": e_ts,
+        "duration": dur,
+        "exp_gain": exp_gain,
+        "level_up": level_up,
+        "begin_level": int(bl or 0) if str(bl or "").isdigit() else 0,
+        "end_level": int(el or 0) if str(el or "").isdigit() else 0,
+        "begin_exp": int(be or 0) if str(be or "").isdigit() else 0,
+        "end_exp": int(ee or 0) if str(ee or "").isdigit() else 0,
+        "endmsg": clean(d.get("endmsg")),
+        "deaths": len(d.get("revive") or []),
+        "source": "cherry",
+        "path": path,
+        "mtime": mtime,
+        "size": size,
+        "items": items,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 土拨鼠 newRecord.db（第二数据源）
+#   <save>\<服务器>\<账号>.pt\<角色名@hex>\Record\newRecord.db
+#   副本名不在库里，用 IndunID 经 <樱桃>\lib\11.DAT 映射
+# --------------------------------------------------------------------------- #
+def _gbk(v):
+    if isinstance(v, (bytes, bytearray)):
+        return v.decode("gbk", errors="replace")
+    return v
+
+
+def _tbs_conn(path):
+    con = sqlite3.connect("file:%s?mode=ro" % path.replace("\\", "/"),
+                          uri=True, timeout=5)
+    con.text_factory = bytes
+    return con
+
+
+def iter_tobo_dbs(root):
+    """生成 (db_path, 角色名, 角色hex, mtime, size)"""
+    if not root or not os.path.isdir(root):
+        return
+    try:
+        servers = list(os.scandir(root))
+    except OSError:
+        return
+    for sv in servers:
+        if not sv.is_dir():
+            continue
+        try:
+            accounts = list(os.scandir(sv.path))
+        except OSError:
+            continue
+        for acc in accounts:
+            if not acc.is_dir():
+                continue
+            try:
+                chars = list(os.scandir(acc.path))
+            except OSError:
+                continue
+            for ch in chars:
+                if not ch.is_dir() or "@" not in ch.name:
+                    continue
+                db = os.path.join(ch.path, "Record", "newRecord.db")
+                if not os.path.isfile(db):
+                    continue
+                nm, _, hexs = ch.name.partition("@")
+                try:
+                    st = os.stat(db)
+                except OSError:
+                    continue
+                yield db, nm.strip(), hexs.strip().upper(), st.st_mtime, st.st_size
+
+
+def parse_tobo_db(db_path, role="", role_hex="", with_drops=False,
+                  only_rewarded=True):
+    """
+    读一个 newRecord.db → [record]
+      Instances          → 场次（Timestamp/LastUpdate/BeginExp/CurExp）
+      IndunClearRewards  → 通关奖励（对应樱桃 item1）
+      ItemDrops          → 地图掉落（对应 item2，默认不取，保持与 .e 同口径）
+      CharacterDeaths    → 死亡次数
+
+    only_rewarded=True：只保留「产生通关奖励」的实例。
+      土拨鼠的 Instances 会把野外区域也算一条（实测「火山超能场」「水晶洞穴」
+      奖励覆盖率 0%、中位时长 41 秒），不加这道闸，副本榜会被地图灌水。
+    难度：土拨鼠无此字段，留空。
+    """
+    from . import recordini
+    try:
+        dmap = recordini.load_dungeon_dict()
+    except Exception:
+        dmap = {}
+    out = []
+    try:
+        con = _tbs_conn(db_path)
+    except Exception:
+        return out
+    try:
+        rows = con.execute(
+            "SELECT InstanceID, IndunID, Timestamp, LastUpdate,"
+            " BeginLevel, BeginExp, CurLevel, CurExp FROM Instances").fetchall()
+        if not rows:
+            return out
+
+        rewards, deaths, drops = {}, {}, {}
+        for iid, nm, cnt in con.execute(
+                "SELECT InstanceID, ItemName, ItemCount FROM IndunClearRewards"):
+            nm = clean(_gbk(nm))
+            if nm:
+                rewards.setdefault(iid, []).append((nm, int(cnt or 0)))
+        for iid, c in con.execute(
+                "SELECT InstanceID, SUM(DeathCount) FROM CharacterDeaths GROUP BY InstanceID"):
+            deaths[iid] = int(c or 0)
+        if with_drops:
+            for iid, nm, cnt in con.execute(
+                    "SELECT InstanceID, ItemName, ItemCount FROM ItemDrops"):
+                nm = clean(_gbk(nm))
+                if nm:
+                    drops.setdefault(iid, []).append((nm, int(cnt or 0)))
+
+        for (iid, indun, ts, last, blv, bexp, clv, cexp) in rows:
+            if not indun or int(indun) <= 0:
+                continue
+            if only_rewarded and iid not in rewards:
+                continue
+            raw_name = dmap.get(int(indun), "")
+            if not raw_name:
+                continue
+            dur = int(last) - int(ts) if (ts and last) else 0
+            if dur < 0 or dur > 86400:
+                continue
+            exp_gain, level_up = None, 0
+            try:
+                if blv and clv and int(blv) == int(clv) and bexp is not None and cexp is not None:
+                    exp_gain = max(0, int(round(float(cexp) - float(bexp))))
+                elif blv and clv and int(clv) > int(blv):
+                    level_up = 1
+            except Exception:
+                pass
+            items = [(n, q, "item1") for n, q in rewards.get(iid, [])]
+            if with_drops:
+                items += [(n, q, "item2") for n, q in drops.get(iid, [])]
+            out.append({
+                "fp": "t|%s|%s" % (hashlib.sha256(os.path.normcase(os.path.abspath(db_path)).encode("utf-8")).hexdigest(), iid),
+                "role": role or role_hex,
+                "role_hex": role_hex,
+                "dungeon": norm_dungeon(raw_name),
+                "difficulty": "",
+                "script_raw": raw_name,
+                "begin_ts": int(ts) if ts else 0,
+                "end_ts": int(last) if last else 0,
+                "duration": dur,
+                "exp_gain": exp_gain,
+                "level_up": level_up,
+                "begin_level": int(blv or 0),
+                "end_level": int(clv or 0),
+                "begin_exp": int(float(bexp or 0)),
+                "end_exp": int(float(cexp or 0)),
+                "endmsg": "",
+                "deaths": deaths.get(iid, 0),
+                "source": "tobo",
+                "path": db_path,
+                "items": items,
+            })
+    except Exception:
+        pass
+    finally:
+        con.close()
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# SQLite 存储
+# --------------------------------------------------------------------------- #
+SCHEMA_VER = 3          # v2：修复 item 解析（dict）+ 接入土拨鼠
+
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS runs (
+  id INTEGER PRIMARY KEY,
+  fp TEXT UNIQUE NOT NULL,
+  role TEXT NOT NULL, role_hex TEXT NOT NULL,
+  dungeon TEXT NOT NULL, difficulty TEXT DEFAULT '',
+  script_raw TEXT, begin_ts INTEGER, end_ts INTEGER, duration INTEGER,
+  exp_gain INTEGER, level_up INTEGER DEFAULT 0,
+  begin_level INTEGER DEFAULT 0, end_level INTEGER DEFAULT 0,
+  begin_exp INTEGER DEFAULT 0, end_exp INTEGER DEFAULT 0,
+  endmsg TEXT, deaths INTEGER DEFAULT 0, source TEXT DEFAULT 'cherry',
+  path TEXT, mtime REAL, size INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_runs_end ON runs(end_ts);
+CREATE INDEX IF NOT EXISTS idx_runs_role ON runs(role, end_ts);
+CREATE INDEX IF NOT EXISTS idx_runs_dun ON runs(dungeon, end_ts);
+CREATE TABLE IF NOT EXISTS run_items (
+  run_id INTEGER NOT NULL, name TEXT NOT NULL, qty INTEGER DEFAULT 0,
+  bucket TEXT DEFAULT 'item1', PRIMARY KEY (run_id, name, bucket)
+);
+CREATE TABLE IF NOT EXISTS scan_state (k TEXT PRIMARY KEY, v TEXT);
+"""
+
+
+class Store:
+    def __init__(self, db_path):
+        self.path = db_path
+        self._init()
+
+    def _conn(self):
+        con = sqlite3.connect(self.path, timeout=15)
+        con.text_factory = str
+        if hasattr(self, '_roles'):
+            selected = frozenset(self._roles)
+            con.create_function('selected_role', 1, lambda value: int(value in selected))
+            con.execute("CREATE TEMP VIEW runs AS SELECT * FROM main.runs WHERE selected_role(role)")
+        return con
+
+    def for_roles(self, roles):
+        view = object.__new__(Store)
+        view.path = self.path
+        view._roles = tuple(roles)
+        return view
+
+    def _init(self):
+        con = self._conn()
+        try:
+            con.executescript(SCHEMA)
+            cols = {r[1] for r in con.execute("PRAGMA table_info(runs)")}
+            for col in ("begin_level", "end_level", "begin_exp", "end_exp"):
+                if col not in cols:
+                    con.execute("ALTER TABLE runs ADD COLUMN %s INTEGER DEFAULT 0" % col)
+            # v2 迁移：旧版 _pairs 不认 dict，导致 run_items 一直为空。
+            # 升级后必须清空重建，否则道具报表永远没有数据。
+            ver = 0
+            try:
+                row = con.execute(
+                    "SELECT v FROM scan_state WHERE k='schema_ver'").fetchone()
+                ver = int(row[0]) if row else 0
+            except Exception:
+                ver = 0
+            if ver < SCHEMA_VER:
+                if con.execute("SELECT COUNT(*) FROM runs").fetchone()[0]:
+                    backup = sqlite3.connect(self.path + ".before-v3.bak")
+                    try:
+                        con.commit()
+                        con.backup(backup)
+                    finally:
+                        backup.close()
+                # Historical records remain available even when source logs were deleted.
+                for (path,) in con.execute("SELECT DISTINCT path FROM runs WHERE source='cherry' AND path<>''").fetchall():
+                    rows = con.execute("SELECT id FROM runs WHERE source='cherry' AND path=? ORDER BY mtime DESC,id DESC", (path,)).fetchall()
+                    for (rid,) in rows[1:]:
+                        con.execute("DELETE FROM run_items WHERE run_id=?", (rid,))
+                        con.execute("DELETE FROM runs WHERE id=?", (rid,))
+                    fp = hashlib.sha256(os.path.normcase(os.path.abspath(path)).encode('utf-8')).hexdigest()
+                    con.execute("UPDATE runs SET fp=? WHERE id=?", (fp, rows[0][0]))
+                for rid, path, fp in con.execute("SELECT id,path,fp FROM runs WHERE source='tobo'").fetchall():
+                    iid = fp.rsplit('|', 1)[-1]
+                    newfp = 't|%s|%s' % (hashlib.sha256(os.path.normcase(os.path.abspath(path)).encode('utf-8')).hexdigest(), iid)
+                    con.execute("UPDATE runs SET fp=? WHERE id=?", (newfp, rid))
+                con.execute("INSERT OR REPLACE INTO scan_state(k,v) VALUES('schema_ver',?)", (str(SCHEMA_VER),))
+            con.commit()
+        finally:
+            con.close()
+
+    # ---- 同步 ----
+    def seen(self, fp):
+        con = self._conn()
+        try:
+            return con.execute("SELECT 1 FROM runs WHERE fp=?", (fp,)).fetchone() is not None
+        finally:
+            con.close()
+
+    def _write(self, con, rec):
+        cols = ('fp','role','role_hex','dungeon','difficulty','script_raw','begin_ts',
+                'end_ts','duration','exp_gain','level_up','begin_level','end_level',
+                'begin_exp','end_exp','endmsg','deaths','source','path','mtime','size')
+        old = con.execute('SELECT id FROM runs WHERE fp=?', (rec['fp'],)).fetchone()
+        sql = ('INSERT INTO runs(' + ','.join(cols) + ') VALUES(' + ','.join('?' for _ in cols)
+               + ') ON CONFLICT(fp) DO UPDATE SET ' + ','.join(c+'=excluded.'+c for c in cols[1:]))
+        con.execute(sql, tuple(rec.get(c, 0 if c in ('mtime','size') else None) for c in cols))
+        rid = old[0] if old else con.execute('SELECT id FROM runs WHERE fp=?', (rec['fp'],)).fetchone()[0]
+        con.execute('DELETE FROM run_items WHERE run_id=?', (rid,))
+        con.executemany('INSERT INTO run_items(run_id,name,qty,bucket) VALUES(?,?,?,?) ON CONFLICT(run_id,name,bucket) DO UPDATE SET qty=qty+excluded.qty',
+                        [(rid,n,q,b) for n,q,b in rec.get('items',[])])
+        return old is None
+
+    def upsert(self, rec):
+        con = self._conn()
+        try:
+            added = self._write(con, rec)
+            con.commit()
+            return added
+        finally:
+            con.close()
+
+    def count(self):
+        con = self._conn()
+        try:
+            return con.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+        finally:
+            con.close()
+
+    def close(self):
+        """兼容接口：本 Store 每次操作即建即关连接，无需显式释放"""
+        pass
+
+    def sync(self, autolog_dir, resolver=None, full=False, days=2):
+        """增量同步：full=False 只扫最近 days 天的日期目录（单事务批量写）"""
+        if not autolog_dir or not os.path.isdir(autolog_dir):
+            return 0
+        added = 0
+        with _sync_lock:
+            targets = []
+            if full or self.count() == 0:
+                for dp, _dn, fn in os.walk(autolog_dir):
+                    for f in fn:
+                        if f.endswith(".ini"):
+                            targets.append(os.path.join(dp, f))
+            else:
+                cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+                for dp, dn, fn in os.walk(autolog_dir):
+                    base = os.path.basename(dp)
+                    if re.match(r"^\d{4}-\d{2}-\d{2}$", base) and base < cutoff:
+                        dn[:] = []
+                        continue
+                    for f in fn:
+                        if f.endswith(".ini"):
+                            targets.append(os.path.join(dp, f))
+
+            if not targets:
+                return 0
+            con = self._conn()
+            try:
+                con.execute("BEGIN")
+                for p in targets:
+                    rec = parse_file(p, resolver)
+                    if not rec:
+                        continue
+                    added += int(self._write(con, rec))
+                con.commit()
+            except Exception:
+                try:
+                    con.rollback()
+                except Exception:
+                    pass
+                raise
+            finally:
+                con.close()
+        return added
+
+    def sync_tobo(self, root, full=False, with_drops=False, only_rewarded=True):
+        """
+        土拨鼠增量同步：以 db 文件的 mtime+size 作为版本戳（一个 db 含多场）。
+        副本名由 IndunID 经 11.DAT 映射；难度字段不存在，留空。
+
+        ★ 必须单连接 + 单事务：部分角色库里攒了 4000+ 场，
+          逐条开连接会让总耗时从十几秒涨到十几分钟。
+        """
+        if not root or not os.path.isdir(root):
+            return 0
+        added = 0
+        con = self._conn()
+        try:
+            con.execute("BEGIN")
+            for db, role, hexs, mtime, size in iter_tobo_dbs(root):
+                # Include WAL changes; checkpointing may leave the main DB unchanged.
+                stamps = []
+                for part in (db, db + '-wal'):
+                    try:
+                        st = os.stat(part)
+                        stamps.append((st.st_mtime_ns, st.st_size))
+                    except OSError:
+                        stamps.append(None)
+                key = 'tobo|' + os.path.normcase(os.path.abspath(db))
+                signature = json.dumps(stamps)
+                old = con.execute('SELECT v FROM scan_state WHERE k=?', (key,)).fetchone()
+                if not full and old and old[0] == signature:
+                    continue
+                for rec in parse_tobo_db(db, role, hexs, with_drops, only_rewarded):
+                    rec.update(mtime=mtime, size=size)
+                    added += int(self._write(con, rec))
+                con.execute('INSERT OR REPLACE INTO scan_state(k,v) VALUES(?,?)', (key, signature))
+            con.commit()
+        except Exception:
+            try:
+                con.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            con.close()
+        return added
+
+    # ---- 查询 ----
+    def summary(self, start_ts, end_ts, role=None, roles=None):
+        w, args = ("", (start_ts, end_ts))
+        if role:
+            w, args = (" AND role = ?", (start_ts, end_ts, role))
+        elif roles:
+            w = " AND role IN (%s)" % ",".join("?" * len(roles))
+            args = (start_ts, end_ts) + tuple(roles)
+        con = self._conn()
+        try:
+            row = con.execute(
+                "SELECT COUNT(*), IFNULL(SUM(deaths),0), IFNULL(SUM(duration),0), "
+                "COUNT(DISTINCT role), COUNT(DISTINCT dungeon) FROM runs "
+                "WHERE end_ts BETWEEN ? AND ? AND dungeon <> ''" + w, args).fetchone()
+            # ★ 2026-10-30 修：items 查询原来直接复用 args，只在单角色时成立。
+            #   按账户筛选（roles 17 个）时会报 “uses 2, there are 19 supplied”。
+            items_sql = ("SELECT COUNT(*) FROM run_items i JOIN runs r ON r.id=i.run_id "
+                         "WHERE r.end_ts BETWEEN ? AND ? AND r.dungeon <> ''")
+            items_args = (start_ts, end_ts)
+            if role:
+                items_sql += " AND r.role = ?"
+                items_args = (start_ts, end_ts, role)
+            elif roles:
+                items_sql += " AND r.role IN (%s)" % ",".join("?" * len(roles))
+                items_args = (start_ts, end_ts) + tuple(roles)
+            items = con.execute(items_sql, items_args).fetchone()[0]
+        finally:
+            con.close()
+        runs, deaths, dur, chars, duns = row
+        return {"runs": runs, "deaths": deaths,
+                "avg_sec": int(dur / runs) if runs else 0,
+                "chars": chars, "dungeons": duns, "items": items}
+
+    def matrix(self, start_ts, end_ts, with_diff=False, roles=None):
+        con = self._conn()
+        _w, _args = "", [start_ts, end_ts]
+        if roles:
+            _w = " AND role IN (%s)" % ",".join("?" * len(roles))
+            _args += list(roles)
+        try:
+            if with_diff:
+                rows = con.execute(
+                    "SELECT role, dungeon, difficulty, COUNT(*), IFNULL(SUM(deaths),0), "
+                    "IFNULL(AVG(duration),0) FROM runs WHERE end_ts BETWEEN ? AND ? AND dungeon <> '' "
+                    + _w + " GROUP BY role, dungeon, difficulty", _args).fetchall()
+            else:
+                rows = con.execute(
+                    "SELECT role, dungeon, '', COUNT(*), IFNULL(SUM(deaths),0), "
+                    "IFNULL(AVG(duration),0) FROM runs WHERE end_ts BETWEEN ? AND ? AND dungeon <> '' "
+                    + _w + " GROUP BY role, dungeon", _args).fetchall()
+        finally:
+            con.close()
+        chars, duns, cells = [], [], {}
+        tot_runs = tot_deaths = 0
+        for role, dun, diff, n, deaths, avg in rows:
+            col = dun if not with_diff or not diff else "%s·%s" % (dun, diff)
+            if role not in chars:
+                chars.append(role)
+            if col not in duns:
+                duns.append(col)
+            cells["%s|%s" % (role, col)] = {"runs": n, "deaths": deaths,
+                                            "avg_sec": int(avg or 0)}
+            tot_runs += n
+            tot_deaths += deaths
+        return {"rows": chars, "cols": duns, "cells": cells,
+                "totals": {"runs": tot_runs, "deaths": tot_deaths,
+                           "chars": len(chars)}}
+
+    def matrix_strict(self, start_ts, end_ts, with_diff=False,
+                      limits=None, orders=None, blocked=None):
+        """
+        严格口径（对齐 .e）：
+          * 单元格带每周上限 N —— 来自 记录.ini 的 [单次副本]/[N次副本]
+          * 行序按 [角色顺序<账号>]，未列出的排后面
+          * 过滤 [角色屏蔽]
+        返回 {rows:[{role,hex}], cols:[{key,name,diff,limit}], cells, totals}
+        """
+        from . import recordini
+        if limits is None:
+            limits = recordini.load_limits()
+        if orders is None:
+            orders = recordini.load_role_orders()
+        blocked = blocked or set()
+        common, by_acc = orders
+
+        con = self._conn()
+        try:
+            rows = con.execute(
+                "SELECT role, role_hex, dungeon, difficulty, COUNT(*), "
+                "IFNULL(SUM(deaths),0), IFNULL(AVG(duration),0), "
+                "IFNULL(SUM(exp_gain),0) FROM runs "
+                "WHERE end_ts BETWEEN ? AND ? AND dungeon <> '' "
+                "GROUP BY role, role_hex, dungeon, difficulty",
+                (start_ts, end_ts)).fetchall()
+        finally:
+            con.close()
+
+        roles, cells, cols = {}, {}, {}
+        for role, hexid, dun, diff, n, deaths, avg, exp in rows:
+            hexu = (hexid or "").upper()
+            if hexu and hexu in blocked:
+                continue
+            roles.setdefault(hexu or role, role)
+            if with_diff:
+                colkey = "%s#%s" % (dun, diff or "—")
+                disp, dshow = dun, (diff or "")
+            else:
+                colkey, disp, dshow = dun, dun, ""
+            c = cols.setdefault(colkey, {
+                "key": colkey, "name": disp, "diff": dshow,
+                "limit": int(limits.get(dun, DEFAULT_LIMIT))})
+            cells["%s|%s" % (role, colkey)] = {
+                "runs": n,
+                "deaths": int(deaths or 0),
+                "avg_sec": int(avg or 0),
+                "exp": int(exp or 0),
+                "done": n >= c["limit"],
+                "over": n > c["limit"],
+            }
+
+        seq = []
+        for lst in by_acc.values():
+            seq.extend(lst)
+        if not seq:
+            seq = common
+        rank = {h: i for i, h in enumerate(seq)}
+        ordered = sorted(roles.items(), key=lambda kv: (rank.get(kv[0], 10 ** 6), kv[1]))
+        col_list = sorted(cols.values(), key=lambda x: (x["limit"], x["name"]))
+        return {
+            "rows": [{"role": r, "hex": h} for h, r in ordered],
+            "cols": col_list,
+            "cells": cells,
+            "totals": {
+                "runs": sum(c["runs"] for c in cells.values()),
+                "deaths": sum(c["deaths"] for c in cells.values()),
+                "chars": len(ordered),
+                "dungeons": len(col_list),
+            },
+        }
+
+    def daily(self, start_ts, end_ts):
+        """按本地日期分日（用 Python 转换，避免 SQLite localtime 在 Windows 上按 UTC 分日）"""
+        con = self._conn()
+        try:
+            rows = con.execute(
+                "SELECT end_ts, deaths FROM runs WHERE end_ts BETWEEN ? AND ? "
+                "AND dungeon <> ''", (start_ts, end_ts)).fetchall()
+        finally:
+            con.close()
+        agg = {}
+        for ts, d in rows:
+            try:
+                k = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+            except Exception:
+                continue
+            a = agg.setdefault(k, {"date": k, "runs": 0, "deaths": 0})
+            a["runs"] += 1
+            a["deaths"] += int(d or 0)
+        return [agg[k] for k in sorted(agg)]
+
+    def item_rank(self, start_ts, end_ts, limit=20, key_only=None):
+        con = self._conn()
+        try:
+            rows = con.execute(
+                "SELECT i.name, SUM(i.qty) q, COUNT(*) c FROM run_items i "
+                "JOIN runs r ON r.id=i.run_id WHERE r.end_ts BETWEEN ? AND ? AND r.dungeon <> '' "
+                "AND i.bucket IN ('item1','item2') GROUP BY i.name "
+                "ORDER BY q DESC, c DESC LIMIT ?", (start_ts, end_ts, limit)).fetchall()
+        finally:
+            con.close()
+        out = [{"name": n, "qty": int(q or 0), "runs": c} for n, q, c in rows]
+        if key_only:
+            out = [x for x in out if key_only(x["name"])]
+        return out
+
+    def top_dungeons(self, start_ts, end_ts, limit=10):
+        con = self._conn()
+        try:
+            rows = con.execute(
+                "SELECT dungeon, COUNT(*), IFNULL(SUM(deaths),0), IFNULL(AVG(duration),0) "
+                "FROM runs WHERE end_ts BETWEEN ? AND ? AND dungeon <> '' "
+                "GROUP BY dungeon ORDER BY COUNT(*) DESC LIMIT ?",
+                (start_ts, end_ts, limit)).fetchall()
+        finally:
+            con.close()
+        return [{"name": d, "runs": n, "deaths": x, "avg_sec": int(a or 0)}
+                for d, n, x, a in rows]
+
+    def efficiency(self, start_ts, end_ts, limit=30):
+        """副本效率：平均耗时 / 平均经验 / 经验每分钟"""
+        con = self._conn()
+        try:
+            rows = con.execute(
+                "SELECT dungeon, COUNT(*), IFNULL(SUM(deaths),0), "
+                "IFNULL(AVG(NULLIF(duration,0)),0), IFNULL(AVG(NULLIF(exp_gain,0)),0), "
+                "IFNULL(SUM(exp_gain),0), IFNULL(SUM(duration),0) FROM runs "
+                "WHERE end_ts BETWEEN ? AND ? AND dungeon <> '' "
+                "GROUP BY dungeon", (start_ts, end_ts)).fetchall()
+        finally:
+            con.close()
+        out = []
+        for d, n, deaths, avg_dur, avg_exp, exp_sum, dur_sum in rows:
+            per_min = int(exp_sum / (dur_sum / 60.0)) if (dur_sum and exp_sum) else 0
+            out.append({"dungeon": d, "runs": n, "deaths": int(deaths or 0),
+                        "avg_sec": int(avg_dur or 0), "exp_avg": int(avg_exp or 0),
+                        "exp_per_min": per_min})
+        out.sort(key=lambda x: (-x["exp_per_min"], x["avg_sec"] or 10 ** 9))
+        return out[:limit]
+
+    # ---- 经验 / 死亡 / 药品 / 单日明细 ----
+    def exp_report(self, start_ts, end_ts, roles=None):
+        """
+        区间内每个角色的经验变化：
+          樱桃字段的真实含义（实测）：
+            beginlevel/endlevel = 等级（Lv.9212 → Lv.9219）
+            beginexp/endexp     = 经验条百分比 × 100（5456 = 54.56%）
+          所以「涨幅」= 级差×100 + 百分比差
+        """
+        w, extra = "", []
+        if roles:
+            w = " AND role IN (%s)" % ",".join("?" * len(roles))
+            extra = list(roles)
+        args = [start_ts, end_ts] + extra
+        con = self._conn()
+        try:
+            agg = con.execute(
+                "SELECT role, COUNT(*), IFNULL(SUM(duration),0), IFNULL(SUM(deaths),0), "
+                "IFNULL(SUM(level_up),0) FROM runs WHERE end_ts BETWEEN ? AND ? "
+                "AND dungeon <> ''" + w + " GROUP BY role", args).fetchall()
+            firsts = {}
+            for row in con.execute(
+                    "SELECT role, begin_level, begin_exp, begin_ts FROM runs "
+                    "WHERE end_ts BETWEEN ? AND ? AND begin_level > 0" + w +
+                    " ORDER BY begin_ts ASC", args):
+                firsts.setdefault(row[0], row)
+            lasts = {}
+            for row in con.execute(
+                    "SELECT role, end_level, end_exp FROM runs "
+                    "WHERE end_ts BETWEEN ? AND ? AND end_level > 0" + w +
+                    " ORDER BY end_ts DESC", args):
+                lasts.setdefault(row[0], row)
+        finally:
+            con.close()
+
+        out = []
+        for role, runs, dur, deaths, ups in agg:
+            f = firsts.get(role)
+            l = lasts.get(role)
+            lv_b = int(f[1]) if f else 0
+            pc_b = round((f[2] or 0) / 100.0, 2) if f else 0.0
+            lv_e = int(l[1]) if l else 0
+            pc_e = round((l[2] or 0) / 100.0, 2) if l else 0.0
+            gain = 0.0
+            if f and l:
+                gain = (lv_e - lv_b) * 100.0 + (pc_e - pc_b)
+            out.append({
+                "role": role, "runs": runs,
+                "lv_begin": lv_b, "pct_begin": pc_b,
+                "lv_end": lv_e, "pct_end": pc_e,
+                "gain_pct": round(gain, 2),
+                "level_up": int(ups or 0),
+                "sec": int(dur or 0),
+                "gain_per_min": round(gain / (dur / 60.0), 2) if dur else 0,
+                "deaths": int(deaths or 0),
+            })
+        out.sort(key=lambda x: -x["gain_pct"])
+        return out
+
+    def death_report(self, start_ts, end_ts):
+        """死亡：按角色 + 按副本两个维度"""
+        con = self._conn()
+        try:
+            by_role = con.execute(
+                "SELECT role, COUNT(*), IFNULL(SUM(deaths),0) FROM runs "
+                "WHERE end_ts BETWEEN ? AND ? AND dungeon <> '' "
+                "GROUP BY role ORDER BY SUM(deaths) DESC", (start_ts, end_ts)).fetchall()
+            by_dun = con.execute(
+                "SELECT dungeon, COUNT(*), IFNULL(SUM(deaths),0) FROM runs "
+                "WHERE end_ts BETWEEN ? AND ? AND dungeon <> '' AND deaths > 0 "
+                "GROUP BY dungeon ORDER BY SUM(deaths) DESC LIMIT 15",
+                (start_ts, end_ts)).fetchall()
+        finally:
+            con.close()
+        return {
+            "by_role": [{"role": r, "runs": n, "deaths": d} for r, n, d in by_role],
+            "by_dungeon": [{"name": d, "runs": n, "deaths": x} for d, n, x in by_dun],
+        }
+
+    def potion_report(self, start_ts, end_ts, limit=20, keywords=None):
+        """
+        药品/杂项产出：按道具名汇总数量。
+        keywords 为空时用内置兜底词；传入 记录.ini 的 [过滤关键词] 即与 .e 同口径。
+        """
+        kws = tuple(keywords) if keywords else (
+            "药水", "药丸", "胶囊", "圣水", "药", "血清", "试剂")
+        con = self._conn()
+        try:
+            rows = con.execute(
+                "SELECT i.name, SUM(i.qty), COUNT(*) FROM run_items i "
+                "JOIN runs r ON r.id=i.run_id WHERE r.end_ts BETWEEN ? AND ? "
+                "AND r.dungeon <> '' GROUP BY i.name", (start_ts, end_ts)).fetchall()
+        finally:
+            con.close()
+        out = [{"name": n, "qty": int(q or 0), "runs": c}
+               for n, q, c in rows if any(k in (n or "") for k in kws)]
+        out.sort(key=lambda x: -x["qty"])
+        return out[:limit]
+
+    def death_detail(self, start_ts, end_ts, role=None, roles=None, limit=120):
+        """逐场死亡明细（只列有死亡的场次），支持单角色或多角色"""
+        w, extra = "", []
+        if role:
+            w = " AND role = ?"
+            extra = [role]
+        elif roles:
+            w = " AND role IN (%s)" % ",".join("?" * len(roles))
+            extra = list(roles)
+        args = [start_ts, end_ts] + extra + [limit]
+        con = self._conn()
+        try:
+            rows = con.execute(
+                "SELECT role, dungeon, difficulty, end_ts, deaths, duration "
+                "FROM runs WHERE end_ts BETWEEN ? AND ? AND dungeon <> '' "
+                "AND deaths > 0" + w + " ORDER BY end_ts DESC LIMIT ?", args).fetchall()
+        finally:
+            con.close()
+        return [{"role": r, "dungeon": d, "difficulty": df or "",
+                 "time": datetime.fromtimestamp(ts).strftime("%m-%d %H:%M") if ts else "",
+                 "deaths": dd, "duration": dur}
+                for r, d, df, ts, dd, dur in rows]
+
+    def stuck_cases(self, start_ts, end_ts, limit=40, min_sec=300):
+        """
+        卡本候选：结算语不含「执行完毕」，或含「强制飞出」，或耗时异常长。
+        与 .e 的「卡本报告」同口径（它也是靠 endmsg 判的）。
+        """
+        con = self._conn()
+        try:
+            rows = con.execute(
+                "SELECT role, dungeon, difficulty, end_ts, duration, endmsg "
+                "FROM runs WHERE end_ts BETWEEN ? AND ? AND dungeon <> '' "
+                "AND IFNULL(endmsg,'') NOT LIKE '%超过每日%' "
+                "AND IFNULL(endmsg,'') NOT LIKE '%次数%' "
+                "AND ( IFNULL(endmsg,'') LIKE '%强制飞出%' "
+                "   OR ( IFNULL(endmsg,'') NOT LIKE '%执行完毕%' "
+                "        AND IFNULL(duration,0) >= ? ) ) "
+                "ORDER BY end_ts DESC LIMIT ?",
+                (start_ts, end_ts, int(min_sec), limit)).fetchall()
+        finally:
+            con.close()
+        return [{"role": r, "dungeon": d, "difficulty": df or "",
+                 "time": datetime.fromtimestamp(ts).strftime("%m-%d %H:%M") if ts else "",
+                 "duration": int(dur or 0), "endmsg": msg or ""}
+                for r, d, df, ts, dur, msg in rows]
+
+    def day_detail(self, date_str, roles=None):
+        """某一天的全部场次明细（roles 非空时只算这些角色）"""
+        try:
+            s = datetime.strptime(date_str, "%Y-%m-%d")
+        except Exception:
+            return []
+        a = int(s.timestamp())
+        b = int((s + timedelta(days=1)).timestamp()) - 1
+        sql = ("SELECT role, dungeon, difficulty, begin_ts, end_ts, duration, "
+               "deaths, endmsg FROM runs WHERE end_ts BETWEEN ? AND ? "
+               "AND dungeon <> ''")
+        args = [a, b]
+        if roles:
+            sql += " AND role IN (%s)" % ",".join("?" * len(roles))
+            args += list(roles)
+        sql += " ORDER BY end_ts DESC LIMIT 500"
+        con = self._conn()
+        try:
+            rows = con.execute(sql, args).fetchall()
+        finally:
+            con.close()
+        return [{"role": r, "dungeon": d, "difficulty": df,
+                 "begin": datetime.fromtimestamp(x).strftime("%H:%M:%S") if x else "",
+                 "end": datetime.fromtimestamp(y).strftime("%H:%M:%S") if y else "",
+                 "duration": dur, "deaths": dd, "endmsg": m}
+                for r, d, df, x, y, dur, dd, m in rows]
+
+
+# --------------------------------------------------------------------------- #
+# 时间范围
+# --------------------------------------------------------------------------- #
+def range_of(kind):
+    now = datetime.now()
+    if kind == "today":
+        s = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return int(s.timestamp()), int(now.timestamp()), "今日"
+    if kind == "yesterday":
+        s = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        e = s + timedelta(days=1) - timedelta(seconds=1)
+        return int(s.timestamp()), int(e.timestamp()), "昨日"
+    if kind == "lastweek":
+        s = (now - timedelta(days=now.weekday() + 7)).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        e = s + timedelta(days=7) - timedelta(seconds=1)
+        return int(s.timestamp()), int(e.timestamp()), "上周"
+    s = (now - timedelta(days=now.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    return int(s.timestamp()), int(now.timestamp()), "本周"
+
+
+def fmt_dur(sec):
+    sec = int(sec or 0)
+    return "%d分%02d秒" % (sec // 60, sec % 60) if sec >= 60 else "%d秒" % sec
+
+
+def render_text_summary(store, kind="today"):
+    """QQ 指令：日报 / 周报"""
+    s, e, label = range_of(kind)
+    su = store.summary(s, e)
+    if not su["runs"]:
+        return "📊 %s：还没有副本记录" % label
+    lines = ["📊 %s副本报表" % label,
+             "🎯 场次 %d｜💀 死亡 %d｜👥 角色 %d｜🗺 副本 %d" % (
+                 su["runs"], su["deaths"], su["chars"], su["dungeons"]),
+             "⏱ 平均耗时 %s" % fmt_dur(su["avg_sec"])]
+    tops = store.top_dungeons(s, e, 5)
+    if tops:
+        lines.append("")
+        lines.append("🔥 副本 Top5：")
+        for t in tops:
+            lines.append("  %s ×%d（%s）" % (t["name"], t["runs"], fmt_dur(t["avg_sec"])))
+    items = store.item_rank(s, e, 5)
+    if items:
+        lines.append("")
+        lines.append("🎁 道具 Top5：")
+        for it in items:
+            lines.append("  %s ×%d" % (it["name"], it["qty"] or it["runs"]))
+    return "\n".join(lines)
+
+
+def render_text_matrix(store, kind="week", limit_cols=6):
+    """QQ 指令：矩阵（角色 × 副本，人多了只发文本摘要）"""
+    s, e, label = range_of(kind)
+    mx = store.matrix(s, e)
+    if not mx["rows"]:
+        return "📊 %s：还没有副本记录" % label
+    cols = mx["cols"][:limit_cols]
+    lines = ["📋 %s 角色 × 副本" % label]
+    for role in mx["rows"]:
+        parts = []
+        for c in cols:
+            cell = mx["cells"].get("%s|%s" % (role, c))
+            parts.append("%s %d" % (c, cell["runs"]) if cell else "")
+        body = "｜".join([p for p in parts if p]) or "—"
+        lines.append("· %s：%s" % (role, body))
+    if len(mx["cols"]) > limit_cols:
+        lines.append("…共 %d 个副本，面板可看完整矩阵" % len(mx["cols"]))
+    return "\n".join(lines)

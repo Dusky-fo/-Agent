@@ -1,0 +1,14 @@
+{
+  "id": "legacy_cherry",
+  "name": "旧版樱桃适配（可选，默认不安装）",
+  "version": "0.1.0",
+  "core_version": "0.1.0",
+  "permissions": [
+    "ui:third-party-window",
+    "files:explicit-legacy-root",
+    "process:query"
+  ],
+  "tools": [
+    "legacy_cherry.status"
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "id": "example",
+  "name": "无副作用示例插件",
+  "version": "1.0.0",
+  "core_version": "1.0",
+  "permissions": [],
+  "tools": ["example.ping"]
+}

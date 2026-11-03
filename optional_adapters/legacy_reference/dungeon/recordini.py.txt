@@ -1,0 +1,256 @@
+# -*- coding: utf-8 -*-
+"""
+dungeon.recordini —— 读 记录.ini 与 lib\\11.DAT
+
+完全参照 .e 的口径：
+  [单次副本] .. [15次副本]   → 每周次数上限（键为 副本1..副本10）
+  [自定义副本]               → 副本清单
+  [配置编辑-副本文件]         → 通用副本列表（本机可能为空）
+  [角色屏蔽]                 → 屏蔽角色
+  [账号备注]                 → 角色 hex → 备注
+  [角色顺序<账号>] / [角色顺序] → 角色顺序
+  [关键道具]                 → 道具N / 匹配类型N
+  [过滤关键词]               → 关键词N（药品/杂项统计）
+  lib\\11.DAT                → IndunID → 副本名（土拨鼠用）
+"""
+import os
+import re
+
+from . import config
+
+
+# --------------------------------------------------------------------------
+# 基础读取
+# --------------------------------------------------------------------------
+
+def read_ini(path):
+    """GBK 读取 ini → {section: [(k, v), ...]}（保序）"""
+    data = {}
+    if not path or not os.path.isfile(path):
+        return data
+    try:
+        with open(path, "rb") as f:
+            txt = f.read().decode("gbk", errors="ignore")
+    except OSError:
+        return data
+    sec = ""
+    for line in txt.splitlines():
+        line = line.strip()
+        if not line or line.startswith(";"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            sec = line[1:-1].strip()
+            data.setdefault(sec, [])
+            continue
+        if "=" in line:
+            k, v = line.split("=", 1)
+            data.setdefault(sec, []).append((k.strip(), v.strip()))
+    return data
+
+
+def _split_names(v):
+    return [x.strip() for x in re.split(r"[,，、;；]", v or "") if x.strip()]
+
+
+# --------------------------------------------------------------------------
+# 次数上限
+# --------------------------------------------------------------------------
+
+def load_limits(root=None):
+    """
+    {副本名: 每周上限}
+    [单次副本] → 1；[N次副本] → N；未命中的副本由调用方用 DEFAULT_LIMIT
+    """
+    sec = read_ini(config.record_ini(root))
+    limits = {}
+    for name, pairs in sec.items():
+        m = re.match(r"^(\d+)\s*次副本$", name)
+        if name == "单次副本":
+            n = 1
+        elif m:
+            n = int(m.group(1))
+        else:
+            continue
+        for _k, v in pairs:
+            for one in _split_names(v):
+                limits[one] = n
+    return limits
+
+
+def limit_of(dungeon, limits):
+    return int(limits.get(dungeon, config.DEFAULT_LIMIT))
+
+
+# --------------------------------------------------------------------------
+# 副本清单
+# --------------------------------------------------------------------------
+
+def load_custom_dungeons(root=None):
+    sec = read_ini(config.record_ini(root))
+    out = set()
+    for k, v in sec.get("自定义副本", []):
+        if k:
+            out.add(k)
+        for one in _split_names(v):
+            out.add(one)
+    return out
+
+
+def load_common_list(root=None):
+    """[配置编辑-副本文件] 通用副本列表（实测本机为空，必须允许为空）"""
+    sec = read_ini(config.record_ini(root))
+    out = set()
+    for k, v in sec.get("配置编辑-副本文件", []):
+        if k == "通用副本列表":
+            out |= set(_split_names(v))
+    return out
+
+
+# --------------------------------------------------------------------------
+# 角色
+# --------------------------------------------------------------------------
+
+def load_blocked(root=None):
+    """[角色屏蔽] → {hex}；兼容 '屏蔽角色=hex,hex' 与 '角色1=hex' 两种写法"""
+    sec = read_ini(config.record_ini(root))
+    out = set()
+    for k, v in sec.get("角色屏蔽", []):
+        if k == "屏蔽角色" or k.startswith("角色"):
+            out |= {x.upper() for x in _split_names(v)}
+    return out
+
+
+def load_notes(root=None):
+    """[账号备注] → {hex.upper(): 备注}"""
+    sec = read_ini(config.record_ini(root))
+    out = {}
+    for k, v in sec.get("账号备注", []):
+        if k and v:
+            out[k.strip().upper()] = v.strip()
+    return out
+
+
+def load_role_orders(root=None):
+    """
+    返回 (通用顺序, {账号: 顺序})
+      [角色顺序]        → 通用
+      [角色顺序<账号>]  → 分账号（实测本机为此形态）
+    """
+    sec = read_ini(config.record_ini(root))
+    common = []
+    by_acc = {}
+    for name, pairs in sec.items():
+        if not name.startswith("角色顺序"):
+            continue
+        ids = []
+        for _k, v in pairs:
+            for one in _split_names(v):
+                if one:
+                    ids.append(one.strip().upper())
+        if name == "角色顺序":
+            common = ids
+        else:
+            acc = name[len("角色顺序"):].strip()
+            if acc:
+                by_acc[acc] = ids
+    return common, by_acc
+
+
+# --------------------------------------------------------------------------
+# 关键道具 / 过滤关键词
+# --------------------------------------------------------------------------
+
+def load_key_items(root=None):
+    """[关键道具] → [{'name':..., 'type':'exact'|'fuzzy'}]（按序号配对）"""
+    sec = read_ini(config.record_ini(root))
+    names, types = {}, {}
+    for k, v in sec.get("关键道具", []):
+        m = re.match(r"^道具(\d+)$", k)
+        if m:
+            names[int(m.group(1))] = v.strip()
+            continue
+        m = re.match(r"^匹配类型(\d+)$", k)
+        if m:
+            types[int(m.group(1))] = v.strip()
+    out = []
+    for i in sorted(names):
+        nm = names[i]
+        if not nm:
+            continue
+        t = types.get(i, "精确")
+        out.append({"name": nm, "type": "fuzzy" if "模糊" in t else "exact"})
+    return out
+
+
+def load_filter_keywords(root=None):
+    """[过滤关键词] → [词]（药品/杂项统计口径）"""
+    sec = read_ini(config.record_ini(root))
+    out = []
+    for k, v in sec.get("过滤关键词", []):
+        if v and v.strip():
+            out.append(v.strip())
+    return out
+
+
+# --------------------------------------------------------------------------
+# lib\11.DAT → IndunID 映射（土拨鼠专用）
+# --------------------------------------------------------------------------
+
+_DUNGEON_DICT_CACHE = {"key": None, "val": {}}
+
+
+def load_dungeon_dict(root=None):
+    """
+    11.DAT 每行：
+      2;2;5;448;10;1183;智海;SLv.30++;8630118;8630119;1;5;10;50;75;125;120
+                 ^^^ 第4列 = IndunID            ^^^ 第7列 = 副本名
+    返回 {IndunID:int -> 副本名}
+    """
+    p = os.path.join(config.lib_dir(root), "11.DAT")
+    if _DUNGEON_DICT_CACHE["key"] == p and _DUNGEON_DICT_CACHE["val"]:
+        return _DUNGEON_DICT_CACHE["val"]
+    out = {}
+    if os.path.isfile(p):
+        try:
+            txt = open(p, "rb").read().decode("gbk", errors="replace")
+        except OSError:
+            txt = ""
+        for line in txt.splitlines():
+            parts = line.split(";")
+            if len(parts) < 7:
+                continue
+            iid, name = parts[3].strip(), parts[6].strip()
+            if iid.isdigit() and name:
+                out[int(iid)] = name
+    _DUNGEON_DICT_CACHE["key"] = p
+    _DUNGEON_DICT_CACHE["val"] = out
+    return out
+
+
+def load_dungeon_levels(root=None):
+    """{副本名: 'SLv.30++'}（11.DAT 第 8 列），用于展示副本等级门槛"""
+    p = os.path.join(config.lib_dir(root), "11.DAT")
+    out = {}
+    if not os.path.isfile(p):
+        return out
+    try:
+        txt = open(p, "rb").read().decode("gbk", errors="replace")
+    except OSError:
+        return out
+    for line in txt.splitlines():
+        parts = line.split(";")
+        if len(parts) >= 8 and parts[6].strip():
+            out[parts[6].strip()] = parts[7].strip()
+    return out
+
+
+def normalize(name):
+    """副本名规范化：别名替换 + 去难度后缀"""
+    n = str(name or "").strip()
+    if not n:
+        return ""
+    for k, v in config.DUNGEON_ALIAS.items():
+        if k in n:
+            return v
+    n = re.sub(r"[-－]\s*(简单|普通|困难|炼狱|剧情)$", "", n).strip()
+    return n

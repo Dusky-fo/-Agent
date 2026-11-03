@@ -1,0 +1,294 @@
+# -*- coding: utf-8 -*-
+"""
+dungeon.modules —— 六个报表模块（口径与展现对齐「龙猫站团本小精灵 v6.5」）
+
+每个模块统一返回：
+    {"key": "potion", "title": "药品报告", "summary": "…", "lines": ["…", …]}
+
+调用方可直接拼成文本、按行分页发 QQ，或转成面板 JSON。
+
+| 模块   | 数据源                        | 聚合维度          | 排序       |
+|--------|-------------------------------|-------------------|------------|
+| matrix | runs(dungeon) + 记录.ini 上限 | 角色 × 副本       | 上限、名称 |
+| daily  | runs                          | 按天 / 按场次     | 时间倒序   |
+| exp    | runs.begin/end level+exp      | 角色              | 涨幅倒序   |
+| death  | runs.deaths                   | 角色 / 副本       | 次数倒序   |
+| stuck  | runs.endmsg + duration        | 场次              | 时间倒序   |
+| potion | run_items + 过滤关键词        | 道具名（+角色）   | 数量倒序   |
+"""
+from datetime import datetime, timedelta
+
+from . import config, recordini
+
+
+# ---------------------------------------------------------------- 文本工具
+
+def _w(s):
+    """显示宽度：中文算 2"""
+    return sum(2 if ord(c) > 127 else 1 for c in str(s))
+
+
+def pad(s, width, align="<"):
+    s = str(s)
+    p = max(0, width - _w(s))
+    return (s + " " * p) if align == "<" else (" " * p + s)
+
+
+def cut(s, n):
+    """按显示宽度截断（中文按 2 计）"""
+    s = str(s or "")
+    out, w = "", 0
+    for ch in s:
+        cw = 2 if ord(ch) > 127 else 1
+        if w + cw > n:
+            break
+        out += ch
+        w += cw
+    return out
+
+
+def fmt_dur(sec):
+    sec = int(sec or 0)
+    if sec <= 0:
+        return "—"
+    if sec < 60:
+        return "%d秒" % sec
+    if sec < 3600:
+        return "%d分%02d秒" % (sec // 60, sec % 60)
+    return "%d时%02d分" % (sec // 3600, (sec % 3600) // 60)
+
+
+def table(headers, rows, aligns=None, sep=" "):
+    """等宽文本表；返回行列表（不含分隔线）"""
+    cols = len(headers)
+    aligns = aligns or ["<"] + [">"] * (cols - 1)
+    widths = []
+    for i in range(cols):
+        w = max([_w(headers[i])] + [_w(r[i]) for r in rows]) if rows else _w(headers[i])
+        widths.append(w)
+    out = [sep.join(pad(headers[i], widths[i], aligns[i]) for i in range(cols)).rstrip()]
+    for r in rows:
+        out.append(sep.join(pad(r[i], widths[i], aligns[i]) for i in range(cols)).rstrip())
+    return out
+
+
+# ---------------------------------------------------------------- 各模块
+
+def matrix(store, start_ts, end_ts, cols=8, by_diff=False):
+    """主表格：角色 × 副本，单元格 = 已打/上限"""
+    mx = store.matrix_strict(start_ts, end_ts, with_diff=by_diff,
+                            limits=recordini.load_limits(),
+                            orders=recordini.load_role_orders(),
+                            blocked=recordini.load_blocked())
+    total = {}
+    for k, v in mx["cells"].items():
+        ck = k.split("|", 1)[1]
+        total[ck] = total.get(ck, 0) + v["runs"]
+    cols_all = sorted(mx["cols"], key=lambda c: -total.get(c["key"], 0))
+    show = cols_all[:cols]
+
+    lines = []
+    if not mx["rows"]:
+        return {"key": "matrix", "title": "角色 × 副本", "summary": "没有记录", "lines": []}
+
+    hdr = ["角色"] + [cut(c["name"], 6) for c in show]
+    body = []
+    for r in mx["rows"]:
+        line = [cut(r["role"], 6)]
+        for c in show:
+            cell = mx["cells"].get("%s|%s" % (r["role"], c["key"]))
+            if not cell:
+                line.append("·")
+            else:
+                mark = "+" if cell["over"] else ("*" if cell["done"] else "")
+                line.append("%d/%d%s" % (cell["runs"], c["limit"], mark))
+        body.append(line)
+    lines += table(hdr, body, ["<"] + [">"] * len(show))
+    if len(cols_all) > len(show):
+        lines.append("（按场次取前 %d 个，共 %d 个副本）" % (len(show), len(cols_all)))
+    lines.append("* 达标　+ 超出上限　· 未打　分母 = 记录.ini 的 [N次副本]")
+
+    return {
+        "key": "matrix",
+        "title": "角色 × 副本（本周）",
+        "summary": "场次 %d｜死亡 %d｜角色 %d｜副本 %d" % (
+            mx["totals"]["runs"], mx["totals"]["deaths"],
+            mx["totals"]["chars"], mx["totals"]["dungeons"]),
+        "lines": lines,
+        "raw": mx,
+    }
+
+
+def daily(store, date_str=None, limit=40):
+    """单日报告：某天全部场次（时间/角色/副本/耗时/死亡）"""
+    date_str = date_str or datetime.now().strftime("%Y-%m-%d")
+    rows = store.day_detail(date_str)
+    if not rows:
+        return {"key": "daily", "title": "单日报告 %s" % date_str,
+                "summary": "当天没有记录", "lines": []}
+    body = []
+    runs = deaths = 0
+    for r in rows[:limit]:
+        body.append([r["end"][:5], cut(r["role"], 5), cut(r["dungeon"], 8),
+                     fmt_dur(r["duration"]), str(r["deaths"])])
+        runs += 1
+        deaths += int(r["deaths"] or 0)
+    lines = table(["时间", "角色", "副本", "耗时", "死"], body,
+                  ["<", "<", "<", ">", ">"])
+    if len(rows) > limit:
+        lines.append("…另有 %d 场未列出" % (len(rows) - limit))
+    return {"key": "daily", "title": "单日报告 %s" % date_str,
+            "summary": "共 %d 场｜死亡 %d 次" % (len(rows), deaths),
+            "lines": lines}
+
+
+def exp(store, start_ts, end_ts):
+    """经验报告：角色 起止等级/经验、涨幅、场均"""
+    rows = store.exp_report(start_ts, end_ts)
+    if not rows:
+        return {"key": "exp", "title": "经验报告", "summary": "没有记录", "lines": []}
+    body = []
+    for r in rows[:25]:
+        gain = float(r["gain_pct"] or 0)
+        lv = int(gain // 100)
+        rest = gain - lv * 100
+        gain_s = ("+%d级%.0f%%" % (lv, rest)) if lv else ("%.1f%%" % rest)
+        body.append([cut(r["role"], 6),
+                     "%d→%d" % (r["lv_begin"], r["lv_end"]) if r["lv_begin"] else "—",
+                     gain_s,
+                     str(r["runs"]),
+                     "%.1f" % r["gain_per_min"]])
+    lines = table(["角色", "等级", "涨幅", "场次", "每分"], body,
+                  ["<", ">", ">", ">", ">"])
+    lines.append("涨幅 = 级差 + 经验条百分比（樱桃把百分比存成 ×100 的整数）")
+    return {"key": "exp", "title": "经验报告",
+            "summary": "%d 个角色｜合计 %d 级%.0f%%" % (
+                len(rows), int(sum(r["gain_pct"] for r in rows) // 100),
+                sum(r["gain_pct"] for r in rows) % 100),
+            "lines": lines}
+
+
+def death(store, start_ts, end_ts):
+    """死亡报告：按角色 + 按副本 + 最近明细"""
+    d = store.death_report(start_ts, end_ts)
+    lines = []
+    if d["by_role"]:
+        body = [[cut(r["role"], 6), str(r["deaths"]), str(r["runs"]),
+                 "%.2f" % (r["deaths"] / r["runs"] if r["runs"] else 0)]
+                for r in d["by_role"][:12] if r["deaths"]]
+        if body:
+            lines += table(["角色", "死亡", "场次", "场均"], body,
+                           ["<", ">", ">", ">"])
+    if d["by_dungeon"]:
+        lines.append("")
+        body = [[cut(x["name"], 8), str(x["deaths"]), str(x["runs"])]
+                for x in d["by_dungeon"][:10]]
+        lines += table(["副本", "死亡", "场次"], body, ["<", ">", ">"])
+    det = store.death_detail(start_ts, end_ts, limit=8)
+    if det:
+        lines.append("")
+        lines.append("最近：")
+        for x in det:
+            lines.append("· %s %s %s 死%d" % (
+                x["time"], cut(x["role"], 5), cut(x["dungeon"], 6),
+                int(x["deaths"] or 0)))
+    total = sum(r["deaths"] for r in d["by_role"])
+    return {"key": "death", "title": "死亡报告",
+            "summary": "合计死亡 %d 次" % total, "lines": lines}
+
+
+def stuck(store, start_ts, end_ts, limit=15):
+    """卡本报告：结算语异常 / 强制飞出 / 耗时过长"""
+    rows = store.stuck_cases(start_ts, end_ts, limit=limit)
+    if not rows:
+        return {"key": "stuck", "title": "卡本报告",
+                "summary": "没有疑似卡本", "lines": []}
+    body = []
+    for r in rows:
+        reason = r["endmsg"] or "无结算语"
+        if "强制飞出" in reason:
+            reason = "强制飞出"
+        body.append([r["time"], cut(r["role"], 5), cut(r["dungeon"], 7),
+                     fmt_dur(r["duration"]), cut(reason, 8)])
+    lines = table(["时间", "角色", "副本", "耗时", "结算"], body,
+                  ["<", "<", "<", ">", "<"])
+    lines.append("判定：结算语不含「执行完毕」/ 含「强制飞出」/ 单场 ≥5 分钟无结算")
+    return {"key": "stuck", "title": "卡本报告",
+            "summary": "%d 条疑似" % len(rows), "lines": lines}
+
+
+def potion(store, start_ts, end_ts, limit=20, keywords=None, split_by_role=False):
+    """
+    药品/杂项报告：按道具名汇总数量。
+    关键词取 记录.ini 的 [过滤关键词]（图鉴卡/情报卷轴/活力水滴/樱桃药水…），
+    与 .e 的药品统计同源同口径。
+    """
+    kws = keywords if keywords is not None else recordini.load_filter_keywords()
+    rows = store.potion_report(start_ts, end_ts, limit=limit, keywords=kws or None)
+    if not rows:
+        return {"key": "potion", "title": "药品报告",
+                "summary": "没有命中过滤关键词的道具", "lines": []}
+    body = [[cut(r["name"], 12), str(r["qty"]), str(r["runs"])] for r in rows]
+    lines = table(["道具", "数量", "场次"], body, ["<", ">", ">"])
+    lines.append("口径：道具名命中 [过滤关键词]（共 %d 个词）" % len(kws or []))
+    return {"key": "potion", "title": "药品报告",
+            "summary": "%d 种｜合计 %d 个" % (
+                len(rows), sum(r["qty"] for r in rows)),
+            "lines": lines}
+
+
+ALL = ("matrix", "daily", "exp", "death", "stuck", "potion")
+
+
+def build(store, key, start_ts, end_ts, **kw):
+    fn = {"matrix": matrix, "daily": daily, "exp": exp, "death": death,
+          "stuck": stuck, "potion": potion}.get(key)
+    if not fn:
+        raise ValueError("未知报表：%s" % key)
+    if key == "daily":
+        return fn(store, kw.get("date_str"), **{k: v for k, v in kw.items()
+                                                if k != "date_str"})
+    return fn(store, start_ts, end_ts, **kw)
+
+
+# ---------------------------------------------------------------- 分段
+
+def split_text(text, limit=900):
+    """
+    按行切段（不截断单行），每段带 (i/n) 头。
+    QQ 单条有长度上限，长报表必须拆开发，否则整条被拒。
+    """
+    text = str(text or "")
+    if len(text) <= limit:
+        return [text]
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:          # 超长单行硬切
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if len(cur) + len(line) + 1 > limit:
+            if cur:
+                chunks.append(cur)
+            cur = line
+        else:
+            cur = (cur + "\n" + line) if cur else line
+    if cur:
+        chunks.append(cur)
+    n = len(chunks)
+    return ["(%d/%d)\n%s" % (i + 1, n, c) for i, c in enumerate(chunks)]
+
+
+def render(mod, with_title=True):
+    """模块 → 一段文本"""
+    parts = []
+    if with_title:
+        parts.append("📊 %s" % mod["title"])
+    if mod.get("summary"):
+        parts.append(mod["summary"])
+    if mod.get("lines"):
+        parts.append("")
+        parts.extend(mod["lines"])
+    return "\n".join(parts)

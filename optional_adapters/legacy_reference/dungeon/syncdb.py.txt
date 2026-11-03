@@ -1,0 +1,152 @@
+# -*- coding: utf-8 -*-
+"""
+dungeon.syncdb —— 读 樱桃\\data\\SynchroDB\\*.syn
+
+.syn 是脚本自己写的「角色快照」，明文 JSON：
+    {
+      "player": 13183,                 ← 游戏内角色数字ID（报表里的角色标识）
+      "time":   "1793323526",
+      "dress":  {"65537": "上位星辰漫游猫(帽子)", ...},   ← 槽位 → 装备名（已是中文）
+      "equipment": {同 dress},
+      "item_0".."item_6": {"80870155": 1, ...},           ← 物品ID → 数量（无名字）
+      "indun":  {"454": 3, "448": 0, ...},                ← 副本ID → 脚本已打次数
+      "indunreward": {"449": ...}
+    }
+
+用途：
+  1) 角色数字ID清单 —— 供「角色ID备注」页面手打映射
+  2) indun 次数 —— 与 AutoLog 统计交叉校验（脚本自己记的数，含扫荡）
+  3) equipment —— 角色当前装备快照
+
+注意：AutoLog 用「角色 hex 目录」，syn 用「数字ID」，两者无法自动关联
+（System.json 里没有 player 字段），所以备注只能人工维护 —— 这正是 .e 里
+「角色 ID 备注」存在的根本原因。
+"""
+import glob
+import json
+import os
+import time
+
+from . import config, recordini
+
+_REMARK_FILE = os.path.join(config.data_dir(), "role_remarks.json")
+_CACHE = {"ts": 0.0, "data": []}
+
+
+def scan(root=None, force=False):
+    """扫描 SynchroDB → [ {player, time, file, dress_n, item_n, indun, equipment} ]"""
+    now = time.time()
+    if not force and _CACHE["data"] and now - _CACHE["ts"] < 60:
+        return _CACHE["data"]
+    base = os.path.join(root or config.cherry_root(), "data", "SynchroDB")
+    out = []
+    for p in sorted(glob.glob(os.path.join(base, "*.syn"))):
+        try:
+            raw = open(p, "rb").read()
+            d = json.loads(raw.decode("gbk", errors="replace"))
+        except Exception:
+            continue
+        if not isinstance(d, dict):
+            continue
+        items = {}
+        for i in range(7):
+            v = d.get("item_%d" % i)
+            if isinstance(v, dict):
+                for k, n in v.items():
+                    try:
+                        items[k] = items.get(k, 0) + int(n)
+                    except Exception:
+                        pass
+        indun = {}
+        for k, n in (d.get("indun") or {}).items():
+            try:
+                indun[str(k)] = int(n)
+            except Exception:
+                pass
+        out.append({
+            "player": str(d.get("player") or os.path.splitext(os.path.basename(p))[0]),
+            "time": str(d.get("time") or ""),
+            "file": os.path.basename(p),
+            "dress": d.get("dress") or {},
+            "equipment": d.get("equipment") or {},
+            "items": items,
+            "indun": indun,
+        })
+    _CACHE.update(ts=now, data=out)
+    return out
+
+
+def indun_counts(root=None, with_name=True):
+    """
+    {player: {副本名: 脚本记录次数}}（只保留 >0）
+    indun 是脚本自己维护的进度，和 AutoLog 逐条统计可能略有出入，
+    适合做「本周已打次数」的交叉校验。
+    """
+    dmap = recordini.load_dungeon_dict(root) if with_name else {}
+    out = {}
+    for s in scan(root):
+        m = {}
+        for k, n in s["indun"].items():
+            if n <= 0:
+                continue
+            name = dmap.get(int(k), k) if k.isdigit() else k
+            m[str(name)] = m.get(str(name), 0) + n
+        if m:
+            out[s["player"]] = m
+    return out
+
+
+# ---------------------------------------------------------------- 备注
+
+def load_remarks():
+    try:
+        with open(_REMARK_FILE, "r", encoding="utf-8-sig") as f:
+            d = json.load(f)
+        return {str(k): str(v) for k, v in (d or {}).items() if str(v).strip()}
+    except Exception:
+        return {}
+
+
+def save_remarks(d):
+    os.makedirs(os.path.dirname(_REMARK_FILE), exist_ok=True)
+    tmp = _REMARK_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({str(k): str(v) for k, v in d.items() if str(v).strip()},
+                  f, ensure_ascii=False, indent=2)
+    os.replace(tmp, _REMARK_FILE)
+    return _REMARK_FILE
+
+
+def set_remark(player, name):
+    d = load_remarks()
+    p = str(player)
+    if str(name or "").strip():
+        d[p] = str(name).strip()
+    else:
+        d.pop(p, None)
+    save_remarks(d)
+    return d
+
+
+def label_of(player, remarks=None):
+    """报表里显示：有备注用备注，没备注用数字ID"""
+    r = remarks if remarks is not None else load_remarks()
+    p = str(player)
+    return r.get(p) or p
+
+
+def roles(root=None):
+    """给面板/QQ 用的角色ID清单（含备注与已打次数）"""
+    rem = load_remarks()
+    out = []
+    for s in scan(root):
+        out.append({
+            "player": s["player"],
+            "label": rem.get(s["player"], ""),
+            "time": s["time"],
+            "dress": len(s["dress"]),
+            "items": len(s["items"]),
+            "indun": sum(1 for v in s["indun"].values() if v > 0),
+        })
+    out.sort(key=lambda x: -x["indun"])
+    return out

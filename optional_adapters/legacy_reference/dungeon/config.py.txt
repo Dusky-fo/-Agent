@@ -1,0 +1,74 @@
+# -*- coding: utf-8 -*-
+"""
+dungeon.config —— 路径与常量
+
+口径来源：龙猫站团本小精灵 v6.5（自动读取副本自定义版）
+本包只做「读取 + 统计」，不写任何外部文件。
+"""
+import os
+import sys
+
+# ---- 默认路径（可在 config.json / 环境变量覆盖）----
+DEFAULT_CHERRY_ROOT = r"D:\Users\Administrator\Desktop\樱桃"
+DEFAULT_TOBO_ROOT = r"D:\Users\Administrator\Downloads\土拨鼠\save"
+
+# ---- .e 内置的副本别名（硬编码，漏一个统计就分叉）----
+DUNGEON_ALIAS = {
+    "星之伊甸": "星能之战",
+    "藏宝洞穴": "藏宝洞",
+}
+
+# ---- 每周次数上限缺省值（.e: 默认返回7次）----
+DEFAULT_LIMIT = 7
+
+# ---- 非副本脚本（.e 的 script_blacklist 等价物）----
+SCRIPT_BLACKLIST = (
+    "执行自动切换角色",
+    "【存】材料",
+    "执行自动存仓",
+    "执行自动修理",
+    "执行自动出售",
+    "购买HP胶布",
+)
+
+# ---- 难度枚举（实测全量分布只有这 5 种）----
+DIFFICULTIES = ("简单", "普通", "困难", "炼狱", "剧情")
+
+DIFF_RE = r"\[副本难度=([^\]\"]+)\]"
+
+
+def base_dir():
+    """exe / 源码所在目录（打包后跟随 exe）"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def data_dir():
+    d = os.path.join(base_dir(), "data")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def db_path():
+    return os.path.join(data_dir(), "guard_stats.db")
+
+
+def cherry_root():
+    return os.environ.get("LG_CHERRY_ROOT") or DEFAULT_CHERRY_ROOT
+
+
+def tobo_root():
+    return os.environ.get("LG_TOBO_ROOT") or DEFAULT_TOBO_ROOT
+
+
+def autolog_dir(root=None):
+    return os.path.join(root or cherry_root(), "log", "AutoLog")
+
+
+def record_ini(root=None):
+    return os.path.join(root or cherry_root(), "记录.ini")
+
+
+def lib_dir(root=None):
+    return os.path.join(root or cherry_root(), "lib")

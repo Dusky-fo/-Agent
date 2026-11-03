@@ -1,0 +1,753 @@
+# -*- coding: utf-8 -*-
+"""
+指令路由器：把 QQ 消息翻译成具体动作。
+
+设计原则
+--------
+1. 只依赖 bot 实例的两个能力：bot._reply(message, content=...) 和 bot._pending
+2. 不 import guard_bot，避免循环依赖；插件路径用本文件位置反推
+3. 识别不出就返回 False，交回主程序处理其他指令
+
+覆盖范围
+--------
+- 账号列表、数字选择、挂机/停挂、换表（含自然语言）
+"""
+import asyncio
+import logging
+import os
+import re
+import sys
+import time
+from guard_paths import app_dir
+
+log = logging.getLogger("explorer-guard")
+
+BASE = app_dir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PLUGIN_PATH = os.path.join(BASE, "plugins", "cherry_ctl.py")
+
+_CHERRY = None          # None=未加载  False=不可用  模块=已加载
+
+
+def cherry_plugin():
+    """按需加载 plugins/cherry_ctl.py。发布版不含该目录时返回 False。"""
+    global _CHERRY
+    if _CHERRY is not None:
+        return _CHERRY
+    if not os.path.isfile(PLUGIN_PATH):
+        _CHERRY = False
+        return False
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("cherry_ctl", PLUGIN_PATH)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["cherry_ctl"] = mod
+        spec.loader.exec_module(mod)
+        with open(os.path.join(BASE, "monitor_config.json"), encoding="utf-8-sig") as f:
+            config = __import__("json").load(f)
+        mod.configure((config.get("dungeon") or {}).get("root") or "",
+                      (config.get("ui") or {}).get("assist_key"))
+        _CHERRY = mod
+        log.info("已加载扩展插件：cherry_ctl（版本 %s）",
+                 getattr(mod, "FLOW_VERSION", "?"))
+    except Exception as e:
+        log.warning("扩展插件加载失败：%s", e)
+        _CHERRY = False
+    return _CHERRY
+
+
+# 当前选定的目标进程。存 PID 而不是角色名：游戏内切角色时窗口标题会变，
+# 进程不变，所以 PID 才靠得住。
+_USER_PIDS = {}
+
+
+def _remember_target(pid, openid):
+    if pid:
+        _USER_PIDS[openid] = int(pid)
+
+
+def _pick_target(mod, name, pid=None):
+    """Explicit identity takes precedence; ambiguous targets never pick the first."""
+    if name:
+        key = int(name) if str(name).isdigit() else name
+        h = mod.find_main_window(key)
+        return h or None
+    if pid:
+        return mod.find_main_window(int(pid))
+    if name:
+        return None
+    targets = mod.list_targets()
+    return targets[0]["hwnd"] if len(targets) == 1 else None
+
+
+def _role_by_pid(mod, pid):
+    """用 PID 反查当前角色名（名字会随游戏内切角色变）。"""
+    if not pid:
+        return None
+    try:
+        for t in mod.list_targets():
+            if str(t.get("pid")) == str(pid):
+                return t.get("role")
+    except Exception:
+        pass
+    return None
+
+
+def _match_role_name(text, roles):
+    """从文本里认出角色名。
+
+    先整名包含；不行再按「·」/空格拆段（窗口角色名可能是「必杀剑·闪影」，
+    而用户只叫「闪影」）。
+    """
+    if not text or not roles:
+        return None
+    for r in sorted(roles, key=len, reverse=True):
+        if r and r in text:
+            return r
+    best = None
+    for r in roles:
+        for seg in re.split(r"[·・\s]+", r or ""):
+            if len(seg) >= 2 and seg in text:
+                if best is None or len(seg) > best[1]:
+                    best = (r, len(seg))
+    return best[0] if best else None
+
+
+# ---------------------------------------------------------------- 意图解析
+
+async def _ask_target(bot, message, openid, roles, targets=None):
+    """多号党没指定账号时，必须先让用户选，不能默默拿第一个。
+
+    返回角色名；若已回复“请先选”（返回 None），调用方直接结束。
+    targets 可一并传入，选中时就能记住 PID。
+    """
+    if not roles:
+        return None
+    if len(roles) == 1:
+        return roles[0]
+    bot._pending[openid] = {"kind": "targets", "items": roles,
+                            "targets": targets or [], "ts": time.time()}
+    lines = ["%d. %s" % (i, r) for i, r in enumerate(roles, 1)]
+    await bot._reply(message, content=(
+        "检测到 %d 个账号，先选一个：\n%s\n\n回数字选择，选完再发一次刚才的指令（0 取消）"
+        % (len(roles), "\n".join(lines))))
+    return None
+
+
+async def _natural_plan(text, mod, default_role=None, remembered_pid=None):
+    """从一句话里抽取「做什么、对哪个号、用哪张表」。
+
+    不要求句式，靠关键词与已知名称反向匹配。认不准就请用户补一句，不猜。
+    返回 None 表示没识别出意图。
+    """
+    loop = asyncio.get_running_loop()
+    targets = await loop.run_in_executor(None, mod.list_targets)
+    if not targets:
+        return {"act": "none", "msg": "没找到目标（需先打开主界面）。"}
+
+    roles = [t["role"] for t in targets if t["role"]]
+    role = _match_role_name(text, roles)
+    # 记住的目标名可能因为游戏内切角色而失效，用 PID 拉回来
+    if not role and remembered_pid:
+        _r = _role_by_pid(mod, remembered_pid)
+        if _r and _r in roles:
+            role = _r
+    if not role and default_role and default_role in roles:
+        role = default_role          # 用户之前用数字选定过默认目标
+    if not role:
+        if len(roles) > 1:
+            # 多号党且没选过：先问，不默默拿第一个
+            return {"act": "need_target", "roles": roles, "targets": targets}
+        role = roles[0] if roles else None
+
+    names = await loop.run_in_executor(None, mod.local_names, role)
+
+    table = None
+    cands = []
+    for n in sorted(names, key=len, reverse=True):
+        if len(n) >= 2 and n in text:
+            table = n
+            break
+    if not table:
+        # 整名没命中，从「换 X」里抠出关键词做模糊匹配
+        m = re.search(r"(?:换成|换个|换到|换|切到|切)[\s:：]*([^\s，。！？,.!?]{1,10})", text)
+        key = (m.group(1) if m else "").strip()
+        for junk in ("脚本表", "脚本", "配置", "任务", "表"):
+            key = key.replace(junk, "")
+        key = key.strip()
+        if key:
+            table, cands = mod.match_name(key, names)
+            if not table and not cands:
+                cands = [n for n in names if key and key in n]
+
+    # 查看表清单（不执行动作）
+    if any(w in text for w in ("有哪些表", "有什么表", "表清单", "脚本表",
+                               "看看表", "表的列表", "多少张表")):
+        return {"act": "list", "role": role, "table": None, "names": names}
+
+    if any(w in text for w in ("停", "别挂", "暂停", "收工", "关掉", "收手")):
+        return {"act": "stop", "role": role, "table": None, "names": names}
+
+    if table or cands or any(w in text for w in ("换", "切", "改")):
+        return {"act": "pick", "role": role, "table": table,
+                "cands": cands, "names": names}
+
+    if any(w in text for w in ("挂", "开始", "开工", "跑起来", "干活")):
+        return {"act": "start", "role": role, "table": None, "names": names}
+
+    return None
+
+
+async def _run_plan(bot, message, mod, plan, openid):
+    loop = asyncio.get_running_loop()
+    if not mod.is_admin():
+        await bot._reply(message, content=(
+            "⚠️ 当前程序不是管理员，消息会被系统拒收（UIPI）。\n"
+            "请以管理员身份重新启动后再试。"))
+        return
+
+    act = plan.get("act")
+    role = plan.get("role")
+    if act == "none":
+        await bot._reply(message, content=plan.get("msg") or "")
+        return
+
+    if act == "need_target":
+        await _ask_target(bot, message, openid, plan.get("roles") or [],
+                          plan.get("targets"))
+        return
+
+    if act == "list":
+        names = plan.get("names") or []
+        who = plan.get("role") or "当前账号"
+        if not names:
+            await bot._reply(message, content="没读到脚本表清单（检查配置目录）。")
+            return
+        bot._pending[openid] = {"kind": "tables", "role": plan.get("role"), "items": names,
+                                "ts": time.time()}
+        lines = ["%2d. %s" % (i, n) for i, n in enumerate(names, 1)]
+        await bot._reply(message, content=(
+            "%s 共有 %d 张表：\n%s\n\n回数字直接换（0 取消）" % (
+                who, len(names), "\n".join(lines))))
+        return
+
+    targets = await loop.run_in_executor(None, mod.list_targets)
+    if role:
+        hwnd = await loop.run_in_executor(None, _pick_target, mod, role, _USER_PIDS.get(openid))
+        who = role
+    elif len(targets) == 1:
+        hwnd, who = targets[0]["hwnd"], (targets[0]["role"] or "唯一目标")
+    elif targets:
+        await _ask_target(bot, message, openid, [t["role"] for t in targets], targets)
+        return
+    else:
+        hwnd, who = None, ""
+
+    if not hwnd:
+        await bot._reply(message, content="没找到目标：%s" % (role or "（无可用界面）"))
+        return
+
+    if act == "pick":
+        table = plan.get("table")
+        names = plan.get("names") or []
+        cands = plan.get("cands") or []
+        if not table:
+            if len(cands) == 1:
+                table = cands[0]
+            elif cands:
+                bot._pending[openid] = {"kind": "tables", "role": plan.get("role"),
+                                        "items": cands, "ts": time.time()}
+                lines = ["%d. %s" % (i, c) for i, c in enumerate(cands[:8], 1)]
+                await bot._reply(message, content=(
+                    "🤔 这几个都像，回数字选一个（0 取消）：\n%s" % "\n".join(lines)))
+                return
+            elif names:
+                bot._pending[openid] = {"kind": "tables", "role": plan.get("role"),
+                                        "items": names, "ts": time.time()}
+                lines = ["%2d. %s" % (i, n) for i, n in enumerate(names[:20], 1)]
+                await bot._reply(message, content=(
+                    "🤔 没听出要换成哪张表。%s 现有的：\n%s\n\n"
+                    "回数字直接换（0 取消）" % (who, "\n".join(lines))))
+                return
+            else:
+                await bot._reply(message, content="没读到 %s 的表清单。" % who)
+                return
+
+        have = await loop.run_in_executor(None, mod.local_names, who)
+        if have and table not in have:
+            await bot._reply(message, content=(
+                "%s 没有「%s」这张表。它现有的：\n%s" % (
+                    who, table, "、".join(have[:20]))))
+            return
+
+        ok, msg = await loop.run_in_executor(
+            None, lambda: mod.do_pick_table(table, hwnd=hwnd))
+        await bot._reply(message, content=("✅ " if ok else "❌ ") + msg)
+        return
+
+    fn = mod.do_start if act == "start" else mod.do_stop
+    ok, msg = await loop.run_in_executor(None, lambda: fn(hwnd=hwnd))
+    await bot._reply(message, content=("✅ " if ok else "❌ ") + msg)
+
+
+# ---------------------------------------------------------------- 对外入口
+
+async def _handle(bot, message, text, openid) -> bool:
+    """尝试处理挂机相关指令。返回 True 表示已处理完毕。"""
+    low = (text or "").lower()
+    if _USER_PIDS.get(openid):
+        mod = cherry_plugin()
+        if mod:
+            current = _role_by_pid(mod, _USER_PIDS[openid])
+            if current:
+                bot._target[openid] = current
+            else:
+                _USER_PIDS.pop(openid, None)
+                bot._target.pop(openid, None)
+
+    # ---- 数字回复：按上一次列出的清单类型分流 ----
+    if text.strip().isdigit():
+        p = bot._pending.get(openid)
+        if p and time.time() - p.get("ts", 0) < 600:
+            idx = int(text.strip())
+            items = p.get("items") or []
+            kind = p.get("kind", "tables")
+            if idx == 0:
+                bot._pending.pop(openid, None)
+                await bot._reply(message, content="好的，已取消。")
+                return True
+            if not (1 <= idx <= len(items)):
+                await bot._reply(message, content=(
+                    "序号超范围，当前只有 1~%d，回 0 取消。" % len(items)))
+                return True
+            chosen = items[idx - 1]
+
+            # ⓭ 选的是「操作类型」→ 继续往下分
+            if kind == "action":
+                mod = cherry_plugin()
+                if not mod:
+                    await bot._reply(message, content="扩展已不可用。")
+                    return True
+                loop = asyncio.get_running_loop()
+                role = p.get("role")
+                tail = "\n\n回数字选择（0 取消）"
+                if chosen == "加载脚本表":
+                    names = await loop.run_in_executor(None, mod.local_names, role, ".sc")
+                    if not names:
+                        await bot._reply(message, content="没读到 %s 的脚本表" % (role or "该账号"))
+                        return True
+                    bot._pending[openid] = {"kind": "tables", "role": role,
+                                            "items": names, "ts": time.time()}
+                    await bot._reply(message, content=(
+                        "%s 的脚本表 %d 张：\n%s%s" % (
+                            role or "该账号", len(names),
+                            "\n".join("%2d. %s" % (i, n) for i, n in enumerate(names, 1)),
+                            tail)))
+                    return True
+                if chosen == "读取角色配置":
+                    names = await loop.run_in_executor(None, mod.local_names, role, ".lg")
+                    if not names:
+                        await bot._reply(message, content="没读到 %s 的角色配置" % (role or "该账号"))
+                        return True
+                    bot._pending[openid] = {"kind": "lgcfg", "role": role,
+                                            "items": names, "ts": time.time()}
+                    await bot._reply(message, content=(
+                        "%s 的角色配置 %d 个：\n%s%s" % (
+                            role or "该账号", len(names),
+                            "\n".join("%2d. %s" % (i, n) for i, n in enumerate(names, 1)),
+                            tail)))
+                    return True
+                if chosen == "换世界招募组队":
+                    profs = await loop.run_in_executor(None, mod.load_profiles)
+                    if not profs:
+                        await bot._reply(message, content=(
+                            "还没存组队预设。先在电脑上用命令行存一份：\n"
+                            "python cherry_ctl.py team save <名字> <房间名> <密码> <队长|队员>"))
+                        return True
+                    keys = list(profs.keys())
+                    bot._pending[openid] = {"kind": "team", "role": role,
+                                            "items": keys, "ts": time.time()}
+                    lines = []
+                    for i, k in enumerate(keys, 1):
+                        v = profs[k]
+                        lines.append("%d. %s（房间名 %s，%s）" % (
+                            i, k, v.get("room", ""),
+                            "队长" if v.get("captain") else "队员"))
+                    await bot._reply(message, content=(
+                        "组队预设 %d 个：\n%s%s" % (len(keys), "\n".join(lines), tail)))
+                    return True
+                bot._pending.pop(openid, None)
+                await bot._reply(message, content="不认识这个选项，已取消。")
+                return True
+
+            # ⓫ 选的是「组队预设」→ 直接设世界招募
+            if kind == "team":
+                mod = cherry_plugin()
+                if not mod:
+                    await bot._reply(message, content="扩展已不可用。")
+                    return True
+                loop = asyncio.get_running_loop()
+                _role = p.get("role")
+                profs = await loop.run_in_executor(None, mod.load_profiles)
+                v = profs.get(chosen) or {}
+                hwnd = await loop.run_in_executor(None, _pick_target, mod, _role, _USER_PIDS.get(openid))
+                if not hwnd:
+                    await bot._reply(message, content="没找到目标：%s" % (_role or "第一个"))
+                    return True
+                bot._pending.pop(openid, None)
+                ok, msg = await loop.run_in_executor(
+                    None, lambda: mod.do_team(v.get("room", ""), v.get("password", ""),
+                                              bool(v.get("captain")), hwnd=hwnd))
+                await bot._reply(message, content=(
+                    ("✅" if ok else "❌") + " 组队预设「%s」\n" % chosen) + msg)
+                return True
+
+            # ⓬ 选的是「角色配置」→ 读配置 + 清记录 + 保存
+            if kind == "lgcfg":
+                mod = cherry_plugin()
+                if not mod:
+                    await bot._reply(message, content="扩展已不可用。")
+                    return True
+                loop = asyncio.get_running_loop()
+                _role = p.get("role")
+                hwnd = await loop.run_in_executor(None, _pick_target, mod, _role, _USER_PIDS.get(openid))
+                if not hwnd:
+                    await bot._reply(message, content="没找到目标：%s" % (_role or "第一个"))
+                    return True
+                bot._pending.pop(openid, None)
+                ok, msg = await loop.run_in_executor(
+                    None, lambda: mod.do_role_flow(chosen, hwnd=hwnd))
+                await bot._reply(message, content=(
+                    ("✅" if ok else "❌") + " 角色配置「%s」\n" % chosen) + msg)
+                return True
+
+            # ① 选的是「账号」→ 记住目标，并直接给出操作菜单
+            if kind == "targets":
+                bot._target[openid] = chosen
+                # 同时记住 PID：以后角色名变了也能找回来
+                _targets = p.get("targets") or []
+                _tg = _targets[idx - 1] if idx <= len(_targets) else None
+                if _tg and _tg.get("pid"):
+                    _remember_target(_tg["pid"], openid)
+                opts = ["加载脚本表", "读取角色配置", "换世界招募组队"]
+                bot._pending[openid] = {"kind": "action", "role": chosen,
+                                        "items": opts, "ts": time.time()}
+                await bot._reply(message, content=(
+                    "已选定「%s」。要做什么？\n%s\n\n回数字选择（0 取消）" % (
+                        chosen,
+                        "\n".join("%d. %s" % (i, o) for i, o in enumerate(opts, 1)))))
+                return True
+
+            # ② 选的是「脚本表」→ 真的换表
+            mod = cherry_plugin()
+            if not mod:
+                await bot._reply(message, content="扩展已不可用。")
+                return True
+            loop = asyncio.get_running_loop()
+            _role = p.get("role")
+            have = await loop.run_in_executor(None, mod.local_names, _role)
+            if have and chosen not in have:
+                await bot._reply(message, content=(
+                    "%s 没有「%s」这张表，不能切。\n它现有的：%s" % (
+                        _role or "该账号", chosen, "、".join(have[:20]))))
+                bot._pending.pop(openid, None)
+                return True
+            hwnd = await loop.run_in_executor(None, _pick_target, mod, _role, _USER_PIDS.get(openid))
+            if not hwnd:
+                await bot._reply(message, content="没找到目标：%s" % (_role or "第一个"))
+                return True
+            bot._pending.pop(openid, None)
+            ok, msg = await loop.run_in_executor(
+                None, lambda: mod.do_pick_table(chosen, hwnd=hwnd))
+            await bot._reply(message, content=(
+                ("✅" if ok else "❌") + " 换成「%s」\n" % chosen) + msg)
+            return True
+        # 没有待选清单，数字不处理，交回去
+        return False
+
+    # ---- 地图分类目录（经验/武器/防具…）----
+    if any(w in text for w in ("地图分类", "脚本分类", "分类目录", "哪些分类")) or text.strip() in ("分类",):
+        mod = cherry_plugin()
+        if not mod:
+            await bot._reply(message, content="未安装挂机扩展，此功能不可用。")
+            return True
+        loop = asyncio.get_running_loop()
+        cat = await loop.run_in_executor(None, mod.map_catalog)
+        if not cat:
+            await bot._reply(message, content="还没有分类目录（map_catalog.json 不存在）。")
+            return True
+
+        # 带分类名就直接列该类
+        hit = None
+        for c in cat:
+            if c in text and text.strip() != c:
+                hit = c
+                break
+        if not hit:
+            for c in cat:
+                if text.strip().endswith(c) or text.strip().startswith(c):
+                    hit = c
+                    break
+
+        if hit:
+            items = cat[hit]
+            lines = ["%s（%s）" % (x["name"], x.get("level", "")) for x in items]
+            await bot._reply(message, content=(
+                "【%s】%d 个：\n%s" % (hit, len(items), "\n".join(lines[:40]))))
+            return True
+
+        lines = ["%s %d 个：%s" % (c, len(v),
+                                 "、".join(x["name"] for x in v[:6]))
+                 for c, v in cat.items()]
+        await bot._reply(message, content=("脚本分类 %d 个：\n%s\n\n发「分类 武器」看具体" % (
+            len(cat), "\n".join(lines))))
+        return True
+
+    # ---- 脚本参数（文本层，直接改 .lua，不碰界面）----
+    if text.startswith(("脚本配置", "改配置", "改脚本", "查看配置", "参数")):
+        mod = cherry_plugin()
+        if not mod:
+            await bot._reply(message, content="未安装挂机扩展（plugins 目录不存在），此功能不可用。")
+            return True
+        loop = asyncio.get_running_loop()
+        targets = await loop.run_in_executor(None, mod.list_targets)
+        roles = [t["role"] for t in targets if t["role"]]
+        role = _match_role_name(text, roles) or bot._target.get(openid)
+        if not role:
+            role = await _ask_target(bot, message, openid, roles, targets)
+            if role is None:
+                return True
+
+        cfgs = await loop.run_in_executor(None, mod.list_script_cfgs, role)
+        if not cfgs:
+            await bot._reply(message, content=("没找到 %s 可编辑的脚本配置" % role))
+            return True
+        names = [c["script"] for c in cfgs]
+
+        # 在话里找脚本名（最长优先）
+        script = None
+        for n in sorted(names, key=len, reverse=True):
+            if len(n) >= 2 and n in text:
+                script = n
+                break
+
+        if not script:
+            bot._pending[openid] = {"kind": "scriptcfg", "role": role,
+                                    "items": names, "ts": time.time()}
+            await bot._reply(message, content=(
+                "%s 可编辑的脚本 %d 个：\n%s\n\n回数字看具体参数（0 取消）" % (
+                    role, len(names),
+                    "\n".join("%2d. %s" % (i, n) for i, n in enumerate(names, 1)))))
+            return True
+
+        cfg, raw, path = await loop.run_in_executor(
+            None, lambda: mod.read_script_cfg(role, script))
+        if cfg is None:
+            await bot._reply(message, content=("%s 的「%s」没有配置文件" % (role, script)))
+            return True
+
+        if text.startswith(("改配置", "改脚本")):
+            # 解析「键=值」对（支持中文键与逗号/空格分隔）
+            import re as _re
+            pairs = _re.findall(r"([^\s,，=]+)=([^\s,，]+)", text.replace(script, ""))
+            if not pairs:
+                await bot._reply(message, content=(
+                    "用法：改配置 %s <键>=<值>\n例：改配置 %s 副本难度=困难" % (script, script)))
+                return True
+            changes = {k.strip(): v.strip() for k, v in pairs}
+            ok, msg, done = await loop.run_in_executor(
+                None, lambda: mod.write_script_cfg(role, script, changes))
+            body = ("✅ " if ok else "❌ ") + msg
+            if done:
+                body += "\n" + "\n".join("· " + d for d in done)
+            await bot._reply(message, content=("%s 的「%s」\n" % (role, script)) + body)
+            return True
+
+        # 只看
+        lines = ["%s=%s" % (k, cfg[k]) for k in sorted(cfg) if not k.startswith("一")]
+        await bot._reply(message, content=(
+            "%s 的「%s」共 %d 项：\n%s\n\n改：改配置 %s <键>=<值>" % (
+                role, script, len(lines), "\n".join(lines), script)))
+        return True
+
+    # ---- 角色配置流程：读配置 → 清记录 → 保存 ----
+    if (text.startswith(("重置角色", "角色流程", "刷新角色"))
+            or text.strip() in ("角色配置", "配置", "角色", "角色列表", "切换配置")
+            or (("配置" in text or "角色" in text)
+                and any(w in text for w in ("切换", "换", "读", "重置", "刷新",
+                                           "改", "加载", "看看", "有哪")))):
+        mod = cherry_plugin()
+        if not mod:
+            await bot._reply(message, content="未安装挂机扩展（plugins 目录不存在），此功能不可用。")
+            return True
+        if not mod.is_admin():
+            await bot._reply(message, content=("⚠️ 当前程序不是管理员，消息会被系统拒收（UIPI）。"))
+            return True
+        loop = asyncio.get_running_loop()
+        targets = await loop.run_in_executor(None, mod.list_targets)
+        roles = [t["role"] for t in targets if t["role"]]
+        role = _match_role_name(text, roles) or bot._target.get(openid)
+        if not role:
+            role = await _ask_target(bot, message, openid, roles, targets)
+            if role is None:
+                return True
+
+        cfgs = await loop.run_in_executor(None, mod.local_names, role, ".lg")
+        if not cfgs:
+            await bot._reply(message, content=("没读到 %s 的角色配置清单" % (role or "当前账号")))
+            return True
+
+        # 在话里直接找配置名（最长优先，避免“宝石”抢“宝石副”这类）
+        name = None
+        for c in sorted(cfgs, key=len, reverse=True):
+            if len(c) >= 2 and c in text:
+                name = c
+                break
+
+        # 当前账号没有这个名字：看看别的账号有没有，有就提示切过去
+        if not name:
+            import re as _re2
+            _m = _re2.search(r"(?:成|为|读|用|换|重置)\s*([^\s，。]{1,8})", text)
+            _want = (_m.group(1).strip() if _m else "")
+            for _t in targets:
+                _r2 = _t.get("role")
+                if not _r2 or _r2 == role:
+                    continue
+                _c2 = await loop.run_in_executor(None, mod.local_names, _r2, ".lg")
+                if _want and any(_want in c or c in _want for c in _c2):
+                    await bot._reply(message, content=(
+                        "%s 没有「%s」，但 %s 有。\n要先切到 %s 吗？回「账号」重选" % (
+                            role or "当前账号", _want, _r2, _r2)))
+                    return True
+
+        if not name:
+            bot._pending[openid] = {"kind": "lgcfg", "role": role,
+                                    "items": cfgs, "ts": time.time()}
+            lines = ["%2d. %s" % (i, c) for i, c in enumerate(cfgs, 1)]
+            await bot._reply(message, content=(
+                "%s 的角色配置共 %d 个：\n%s\n\n回数字直接切（0 取消）" % (
+                    role or "当前账号", len(cfgs), "\n".join(lines))))
+            return True
+
+        hwnd = await loop.run_in_executor(None, _pick_target, mod, role, _USER_PIDS.get(openid))
+        if not hwnd:
+            await bot._reply(message, content="没找到目标：%s" % (role or "第一个"))
+            return True
+        ok, msg = await loop.run_in_executor(
+            None, lambda: mod.do_role_flow(name, hwnd=hwnd))
+        await bot._reply(message, content=("✅ " if ok else "❌ ") + msg)
+        return True
+    # ---- 脚本运行进度（读日志，不碰界面）----
+    if any(w in text for w in ("进度", "完成了没", "完成没", "跑到哪", "跑完了",
+                               "脚本状态", "做完了", "剩余")):
+        mod = cherry_plugin()
+        if not mod:
+            await bot._reply(message, content="未安装挂机扩展（plugins 目录不存在），此功能不可用。")
+            return True
+        loop = asyncio.get_running_loop()
+        targets = await loop.run_in_executor(None, mod.list_targets)
+        roles = [t["role"] for t in targets if t["role"]]
+        who = _match_role_name(text, roles) or bot._target.get(openid)
+        if not who:
+            who = await _ask_target(bot, message, openid, roles, targets)
+            if who is None:
+                return True
+        rows = await loop.run_in_executor(None, mod.script_status, who, 5)
+        if not rows:
+            await bot._reply(message, content=("没读到 %s 的运行记录" % (who or "任何角色")))
+            return True
+
+        NAME = {"running": "▶ 运行中", "done": "✅ 已完成",
+                "ended": "⏹ 已结束", "stalled": "⚠ 已卡住"}
+        lines = []
+        for r in rows[:5]:
+            age = r["age_sec"]
+            when = ("%d 分钟前" % (age // 60)) if age >= 60 else ("%d 秒前" % age)
+            note = ""
+            if r["state"] == "ended" and r["endmsg"]:
+                note = "｜" + r["endmsg"][:24]
+            elif r["state"] == "stalled":
+                note = "｜%d 分钟没动静" % (age // 60)
+            lines.append("· %-12s %s（%s）%s" % (
+                r["script"], NAME.get(r["state"], r["state"]), when, note))
+        await bot._reply(message, content=("📋 %s 最近运行：\n%s" % (
+            who or "全部角色", "\n".join(lines))))
+        return True
+
+    # ---- 查看脚本表清单（不依赖“脚本表”这三个字）----
+    if any(w in text for w in ("有哪些表", "有什么表", "表清单", "脚本表", "看看表",
+                               "表的列表", "多少张表", "列出来", "列一下", "列出",
+                               "清单", "列表", "哪些表", "哪些脚本",
+                               "给我看", "抱出来")):
+        mod = cherry_plugin()
+        if not mod:
+            await bot._reply(message, content="未安装挂机扩展（plugins 目录不存在），此功能不可用。")
+            return True
+        loop = asyncio.get_running_loop()
+        targets = await loop.run_in_executor(None, mod.list_targets)
+        if not targets:
+            await bot._reply(message, content="没找到挂机界面（需先打开目标程序的主界面）。")
+            return True
+        roles = [t["role"] for t in targets if t["role"]]
+        # 优先用「选定过或话里提到的角色」，否则第一个
+        role = _match_role_name(text, roles) or bot._target.get(openid) or (roles[0] if roles else None)
+        names = await loop.run_in_executor(None, mod.local_names, role)
+        if not names:
+            names = await loop.run_in_executor(None, mod.local_names, None)
+        if not names:
+            await bot._reply(message, content="没读到脚本表清单（检查配置目录）。")
+            return True
+        bot._pending[openid] = {"kind": "tables", "role": role,
+                                "items": names, "ts": time.time()}
+        lines = ["%2d. %s" % (i, n) for i, n in enumerate(names, 1)]
+        await bot._reply(message, content=(
+            "%s 共有 %d 张表：\n%s\n\n回数字直接换（0 取消）" % (
+                role or "当前账号", len(names), "\n".join(lines))))
+        return True
+
+    # ---- 账号列表 ----
+    if low in ("账号", "挂机账号", "targets"):
+        mod = cherry_plugin()
+        if not mod:
+            await bot._reply(message, content="未安装挂机扩展（plugins 目录不存在），此功能不可用。")
+            return True
+        loop = asyncio.get_running_loop()
+        ts = await loop.run_in_executor(None, mod.list_targets)
+        if not ts:
+            await bot._reply(message, content="没找到挂机界面（需先打开目标程序的主界面）。")
+            return True
+        roles = [t["role"] or "未识别" for t in ts]
+        bot._pending[openid] = {"kind": "targets", "items": roles,
+                                "targets": ts, "ts": time.time()}
+        lines = ["%d. %s（PID %d）%s" % (i, t["role"] or "未识别", t["pid"],
+                                        "" if t["visible"] else " [已隐藏]")
+                 for i, t in enumerate(ts, 1)]
+        cur = bot._target.get(openid)
+        tail = "回数字选定一个作为默认目标（0 取消）"
+        if cur:
+            tail += "\n当前默认：%s" % cur
+        await bot._reply(message, content=("检出 %d 个：\n%s\n\n%s" % (
+            len(ts), "\n".join(lines), tail)))
+        return True
+
+    # ---- 挂机控制（自然语言优先）----
+    _HOOK = ("换", "切", "改", "脚本", "表", "挂", "停", "手工", "收工", "开工")
+    if any(w in text for w in _HOOK) and not text.strip().startswith(
+            ("帮助", "账号", "状态", "今日", "本周", "药品", "死亡",
+             "经验涨幅", "卡本", "单日", "总览", "开启", "取消", "测试")):
+        mod = cherry_plugin()
+        if mod:
+            plan = await _natural_plan(text, mod, bot._target.get(openid), _USER_PIDS.get(openid))
+            if plan:
+                await _run_plan(bot, message, mod, plan, openid)
+                return True
+
+    return False
+
+
+_USER_LOCKS = {}
+
+
+async def handle(bot, message, text, openid) -> bool:
+    lock = _USER_LOCKS.setdefault(openid, asyncio.Lock())
+    async with lock:
+        return await _handle(bot, message, text, openid)

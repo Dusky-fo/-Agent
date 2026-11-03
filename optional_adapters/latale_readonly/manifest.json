@@ -1,0 +1,8 @@
+{
+  "id": "latale_readonly",
+  "name": "彩虹岛进程状态（只读）",
+  "version": "0.1.0",
+  "core_version": "1.0",
+  "permissions": ["process.read"],
+  "tools": ["latale_readonly.status"]
+}

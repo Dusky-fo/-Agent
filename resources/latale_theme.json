@@ -1,0 +1,126 @@
+{
+  "source": "Refactoring UI pass 20261102",
+  "source_sha256": "4ac4334f79531fbed2cb22b9f039bb28ead940cb3ca43b40d0234649df2e25ca",
+  "tokens": {
+    "bg": "#0b0e14",
+    "card": "#12161f",
+    "card2": "#161b26",
+    "line": "#1c232f",
+    "txt": "#e8ecf4",
+    "sub": "#94a1b9",
+    "muted": "#66728c",
+    "accent": "#4c8dff",
+    "accent2": "#6fa0ff",
+    "ok": "#34d399",
+    "warn": "#f5b544",
+    "bad": "#f26d6d"
+  },
+  "sidebar_width": 208,
+  "card_radius": 12,
+  "card_gap": 16,
+  "font": "Microsoft YaHei UI",
+  "themes": {
+    "dark": {
+      "name": "暗色",
+      "tokens": {
+        "bg": "#0b0e14",
+        "card": "#12161f",
+        "card2": "#161b26",
+        "line": "#1c232f",
+        "txt": "#e8ecf4",
+        "sub": "#94a1b9",
+        "muted": "#66728c",
+        "accent": "#4c8dff",
+        "accent2": "#6fa0ff",
+        "ok": "#34d399",
+        "warn": "#f5b544",
+        "bad": "#f26d6d"
+      }
+    },
+    "light": {
+      "name": "明亮",
+      "tokens": {
+        "bg": "#f5f7fc",
+        "card": "#ffffff",
+        "card2": "#ffffff",
+        "line": "#e4e9f4",
+        "txt": "#1b2231",
+        "sub": "#5f6b84",
+        "muted": "#8a94a8",
+        "accent": "#3b74ff",
+        "accent2": "#6f8cff",
+        "ok": "#16a34a",
+        "warn": "#d97706",
+        "bad": "#dc2626"
+      }
+    },
+    "sakura": {
+      "name": "樱粉",
+      "tokens": {
+        "bg": "#1a1017",
+        "card": "#251722",
+        "card2": "#2c1b29",
+        "line": "#3a2534",
+        "txt": "#ffe9f3",
+        "sub": "#cda6bc",
+        "muted": "#9c7c90",
+        "accent": "#ff7ab6",
+        "accent2": "#ffa6d3",
+        "ok": "#4ade80",
+        "warn": "#fbbf24",
+        "bad": "#fb7185"
+      }
+    },
+    "ocean": {
+      "name": "深海",
+      "tokens": {
+        "bg": "#071620",
+        "card": "#0c2230",
+        "card2": "#102b3b",
+        "line": "#17384a",
+        "txt": "#dcf3ff",
+        "sub": "#84b6cc",
+        "muted": "#5d8ba1",
+        "accent": "#22d3ee",
+        "accent2": "#67e8f9",
+        "ok": "#34d399",
+        "warn": "#fbbf24",
+        "bad": "#f87171"
+      }
+    },
+    "violet": {
+      "name": "紫罗兰",
+      "tokens": {
+        "bg": "#0f0b1a",
+        "card": "#191128",
+        "card2": "#1f1633",
+        "line": "#2c2049",
+        "txt": "#ece5ff",
+        "sub": "#a89bd0",
+        "muted": "#7d719f",
+        "accent": "#a855f7",
+        "accent2": "#c084fc",
+        "ok": "#34d399",
+        "warn": "#fbbf24",
+        "bad": "#fb7185"
+      }
+    },
+    "forest": {
+      "name": "森林",
+      "tokens": {
+        "bg": "#0a1410",
+        "card": "#0f1e18",
+        "card2": "#132620",
+        "line": "#1c362b",
+        "txt": "#e3f5e9",
+        "sub": "#93bba6",
+        "muted": "#6a8f7c",
+        "accent": "#34d399",
+        "accent2": "#6ee7b7",
+        "ok": "#4ade80",
+        "warn": "#fbbf24",
+        "bad": "#f87171"
+      }
+    }
+  }
+}
